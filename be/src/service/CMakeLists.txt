@@ -53,6 +53,28 @@ if (${MAKE_TEST} STREQUAL "OFF" AND ${BUILD_BENCHMARK} STREQUAL "OFF")
         ${DORIS_LINK_LIBS}
     )
 
+    # Suppress GLIBC 2.18/2.26/2.27 version tags introduced by Rust std's weak
+    # references (from liblance_c.a / libpaimon_c.a) getting bound to symbols
+    # in ldb_toolchain's Ubuntu 18.04 libc.so.6 (glibc 2.27). ld would otherwise
+    # emit @GLIBC_2.18/2.26/2.27 version requirements and make doris_be unable
+    # to start on hosts with older glibc.
+    #
+    # --defsym=NAME=0 resolves the reference to absolute address 0 without
+    # touching libc.so.6, so no @GLIBC_x.y tag is written into doris_be:
+    #   - __cxa_thread_atexit_impl (2.18): Rust std's `weak!` macro null-checks
+    #     the pointer and falls back to a pthread_key-based dtor chain.
+    #   - copy_file_range (2.27): Rust std's `syscall!` macro null-checks and
+    #     falls back to ENOSYS → read/write loop in std::fs::copy.
+    #   - strfromf128 (2.26): pulled transitively from ldb libstdc++/libgcc_s
+    #     for _Float128 formatting; unreachable in Doris/paimon-rust/lance-c.
+    if (NOT OS_MACOSX)
+        target_link_options(doris_be PRIVATE
+            "LINKER:--defsym=__cxa_thread_atexit_impl=0"
+            "LINKER:--defsym=copy_file_range=0"
+            "LINKER:--defsym=strfromf128=0"
+        )
+    endif()
+
     install(DIRECTORY DESTINATION ${OUTPUT_DIR}/lib/)
     install(TARGETS doris_be DESTINATION ${OUTPUT_DIR}/lib/)
 
