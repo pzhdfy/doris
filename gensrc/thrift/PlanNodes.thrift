@@ -359,6 +359,27 @@ enum TPaimonReaderType {
     PAIMON_RUST = 3,
 }
 
+// Payload kind for Paimon primary-key vector (ANN) search.
+// v1 only uses BUCKET_SPLIT_BYTES; v2 (delayed materialization) will add
+// MATERIALIZE_OPAQUE_BYTES. Kept as an enum from v1 so the wire protocol is
+// shared between v1 and v2 and does not need to change again.
+enum TPaimonVectorPayloadType {
+    // v1 / v2 candidate stage: serialized BucketVectorSearchSplit
+    // (magic "PKVSPLIT", version 1, big-endian; decoded by paimon-rust
+    //  paimon_bucket_vector_search_split_deserialize).
+    BUCKET_SPLIT_BYTES = 0,
+    // v2 materialize stage: opaque bytes produced by the merge/rerank step.
+    MATERIALIZE_OPAQUE_BYTES = 1,
+}
+
+// Per-split vector payload carried on TPaimonFileDesc. The bytes are the raw
+// BucketVectorSearchSplit.serialize form (NOT base64, NOT a Java
+// ObjectOutputStream envelope) whose meaning is determined by payload_type.
+struct TPaimonVectorPayload {
+    1: required TPaimonVectorPayloadType payload_type;
+    2: required binary bytes;
+}
+
 struct TPaimonFileDesc {
     1: optional string paimon_split
     2: optional string paimon_column_names
@@ -384,6 +405,10 @@ struct TPaimonFileDesc {
     // paimon-rust: non-default branch name. Unset means main branch (matches
     // upstream paimon commit 742da63: null-if-DEFAULT_MAIN_BRANCH).
     19: optional string paimon_branch
+    // Primary-key vector (ANN) search payload for this split. When set, BE
+    // routes to the paimon-rust vector-search read path instead of the normal
+    // split read; paimon_split is set but empty in that case.
+    20: optional TPaimonVectorPayload vector_payload;
 }
 
 struct TTrinoConnectorFileDesc {
@@ -553,6 +578,15 @@ struct TVectorSearchOptions {
     4: optional bool use_index
 }
 
+// Paimon-only vector search tuning. Mirrors TVectorSearchOptions: the logical query stays
+// in TVectorSearchParams, provider-specific knobs live here so TExternalSearchRequest stays
+// provider-neutral. The options map is passed straight through to the paimon-rust vector
+// search builder (refine_factor, ivf.nprobe, and the "<algo>.metric" key that matches
+// Paimon's algorithm options).
+struct TPaimonVectorSearchOptions {
+    1: optional map<string, string> options
+}
+
 // The active union field identifies the logical search kind. A future hybrid field can contain both
 // vector and full-text subqueries plus its fusion parameters without changing either existing field.
 union TExternalSearchQuery {
@@ -561,12 +595,16 @@ union TExternalSearchQuery {
 }
 
 // A provider-independent logical search request. Physical target information remains in the
-// provider FileDesc (for example, dataset_uri/version/fragment_ids in TLanceFileDesc).
+// provider FileDesc (for example, dataset_uri/version/fragment_ids in TLanceFileDesc, or
+// vector_payload in TPaimonFileDesc).
 struct TExternalSearchRequest {
     1: optional i32 schema_version = 1
     2: optional TExternalSearchQuery search_query
     3: optional TSearchFilter search_filter
     4: optional TVectorSearchOptions vector_search_options
+    // Paimon-specific vector search tuning. Field 4 stays Lance-neutral, so Paimon's
+    // string-map knobs travel here instead; unset for Lance requests.
+    5: optional TPaimonVectorSearchOptions paimon_options
 }
 
 // A catalog/S3 range reads fragments from a fixed snapshot. A local TVF range uses version zero
@@ -710,6 +748,11 @@ struct TFileScanRangeParams {
     // Non-regular columns in the pinned full schema, including columns pruned from phase one.
     // When present, omitted names are REGULAR. Used to rebuild row-id fetch projections.
     38: optional map<string, TColumnCategory> column_name_to_category
+    // Provider-independent external (vector / full-text) search request, set for a Paimon
+    // primary-key vector (ANN) top-N pushed down into the scan. Set at ScanNode level
+    // (shared by all splits); the per-split physical payload stays in
+    // TPaimonFileDesc.vector_payload. Lance requests use lance_scan_params instead.
+    39: optional TExternalSearchRequest external_search_request
 }
 
 struct TFileRangeDesc {
