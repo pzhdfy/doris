@@ -553,6 +553,10 @@ public class InsertIntoTableCommand extends Command implements NeedAuditEncrypti
                 PaimonInsertCommandContext paimonCtx = insertCtx
                         .map(ctx1 -> (PaimonInsertCommandContext) ctx1)
                         .orElseGet(PaimonInsertCommandContext::new);
+                // Capture the session switch here: the sink reads it at
+                // bindDataSink time, after this command's context is built.
+                paimonCtx.setEnableRustWriter(
+                        ctx.getSessionVariable().getEnablePaimonRustWriter());
                 boolean emptyInsert = childIsEmptyRelation(physicalSink) && !paimonCtx.isOverwrite();
                 return ExecutorFactory.from(
                         planner,

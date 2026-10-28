@@ -666,6 +666,21 @@ struct TPaimonTableSink {
     5: optional TPaimonWriteMode write_mode
     6: optional i64 transaction_id
     7: optional string commit_user
+
+    // Native Rust backend (backend_type = FFI) opens the table from its path and
+    // the FE-resolved TableSchema JSON instead of deserializing the Java table,
+    // the same call the paimon-rust reader makes. The serialized_table stays in
+    // the payload because the FE committer (PaimonTransaction) still decodes it
+    // through the Java SDK; only the BE-side writer switches implementation.
+    8: optional string table_location             // table filesystem root
+    9: optional map<string, string> table_options // storage/credential options for the FileIO layer
+    // FE-resolved TableSchema JSON (PaimonUtil.encodeTableSchemaToJson), consumed
+    // by paimon_table_from_schema_json together with the identifier below.
+    10: optional string table_schema_json
+    11: optional string db_name
+    12: optional string table_name
+    // Paimon branch; absent or empty means the canonical "main" branch.
+    13: optional string branch
 }
 
 struct TDataSink {

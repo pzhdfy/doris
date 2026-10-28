@@ -765,4 +765,41 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " PARALLEL_HASHMAP " ]]; then
     echo "Finished patching ${PARALLEL_HASHMAP_SOURCE} for AArch64 int128"
 fi
 
+# paimon-rust: native FFI write helpers (external committer support).
+#
+# The pinned upstream revision has the write path but no way to hand a prepared
+# commit to an external committer: no Arrow target-schema export and no way to
+# serialize a message range. This patch adds both, plus a version query so the
+# embedding engine frames its payloads with the serializer version this build
+# actually emits instead of hard-coding one. The body layout is pinned to the
+# bundled Paimon Java release (1.4.x -> CommitMessageSerializer v11).
+#
+# Applied by exact filename: patches/ also holds
+# paimon-rust-paimon_plan_from_split_bytes.patch, which predates the pinned
+# revision and does not apply to it (2 of 3 hunks in table.rs fail), so a
+# glob over paimon-rust-* would break the build.
+if [[ " ${TP_ARCHIVES[*]} " =~ " PAIMON_RUST " ]]; then
+    ffi_write_patch="${TP_PATCH_DIR}/paimon-rust-ffi-write-v11.patch"
+    ffi_write_checksum="$(cksum < "${ffi_write_patch}")"
+    ffi_write_marker="${TP_SOURCE_DIR}/${PAIMON_RUST_SOURCE}/${PATCHED_MARK}_ffi_write"
+    # A new local patch must also replace previously patched cached sources;
+    # an older marker cannot identify which patch version produced the tree.
+    if [[ -f "${ffi_write_marker}" ]] &&
+        [[ "$(cat "${ffi_write_marker}")" != "${ffi_write_checksum}" ]]; then
+        rm -rf "${TP_SOURCE_DIR}/${PAIMON_RUST_SOURCE}"
+        "${TAR_CMD}" xzf "${TP_SOURCE_DIR}/${PAIMON_RUST_NAME}" -C "${TP_SOURCE_DIR}/"
+    fi
+    cd "${TP_SOURCE_DIR}/${PAIMON_RUST_SOURCE}"
+    if [[ ! -f "${PATCHED_MARK}_ffi_write" ]]; then
+        # --fuzz=0 --forward: a patch that no longer applies to the pinned
+        # revision must fail loudly instead of silently landing somewhere else
+        # in a file this sensitive.
+        patch --batch --forward --reject-file=- --fuzz=0 --no-backup-if-mismatch -s \
+            -p1 <"${ffi_write_patch}"
+        printf '%s\n' "${ffi_write_checksum}" > "${PATCHED_MARK}_ffi_write"
+    fi
+    cd -
+    echo "Finished patching ${PAIMON_RUST_SOURCE} for the FFI write helpers"
+fi
+
 # vim: ts=4 sw=4 ts=4 tw=100:

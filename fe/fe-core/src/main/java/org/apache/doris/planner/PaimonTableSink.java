@@ -21,10 +21,16 @@ import org.apache.doris.analysis.Expr;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.datasource.credentials.CredentialUtils;
+import org.apache.doris.datasource.credentials.VendedCredentialsFactory;
+import org.apache.doris.datasource.paimon.PaimonExternalCatalog;
 import org.apache.doris.datasource.paimon.PaimonExternalTable;
 import org.apache.doris.datasource.paimon.PaimonTransaction;
+import org.apache.doris.datasource.paimon.PaimonUtil;
 import org.apache.doris.datasource.paimon.PaimonWriteBinding;
 import org.apache.doris.datasource.paimon.PaimonWriteTarget;
+import org.apache.doris.datasource.property.metastore.PaimonJdbcMetaStoreProperties;
+import org.apache.doris.datasource.property.storage.StorageProperties;
 import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertCommandContext;
 import org.apache.doris.nereids.trees.plans.commands.insert.PaimonInsertCommandContext;
@@ -37,10 +43,17 @@ import org.apache.doris.thrift.TPaimonWriteBackendType;
 import org.apache.doris.thrift.TPaimonWriteMode;
 
 import com.google.common.base.Preconditions;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.table.FileStoreTable;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -56,6 +69,12 @@ import java.util.Set;
  */
 public class PaimonTableSink extends BaseExternalTableDataSink {
     public static final String ROW_KIND_COLUMN = "__DORIS_PAIMON_ROW_KIND__";
+
+    /// Warehouse schemes the pinned paimon-rust FileIO can serve. Must stay in
+    /// sync with PaimonScanNode.RUST_VERIFIED_LOCATION_SCHEMES: the same
+    /// storage dispatcher and option families are involved on both sides.
+    private static final Set<String> RUST_WRITER_VERIFIED_SCHEMES =
+            new HashSet<>(Arrays.asList("s3", "s3a", "oss", "hdfs", "file"));
     private final PaimonExternalTable targetTable;
     private final PaimonWriteTarget writeTarget;
     private final DMLCommandType dmlCommandType;
@@ -130,7 +149,30 @@ public class PaimonTableSink extends BaseExternalTableDataSink {
         // exact table instance instead of loading catalog metadata independently.
         tSink.setSerializedTable(binding.getSerializedTable());
 
-        tSink.setBackendType(TPaimonWriteBackendType.JNI);
+        // Backend selection: the native Rust writer needs a payload the C ABI
+        // can consume natively (table path + resolved TableSchema JSON + storage
+        // options) instead of the Java serialized table. The serialized table
+        // stays in the payload either way, because the FE committer
+        // (PaimonTransaction) still decodes it through the Java SDK -- only the
+        // BE-side writer implementation switches.
+        //
+        // Every condition here is a fail-closed gate: when any of them does not
+        // hold we keep the JNI writer, which the JNI path has always handled.
+        if (useRustFfiWriter(ctx)) {
+            tSink.setBackendType(TPaimonWriteBackendType.FFI);
+            tSink.setTableLocation(getTableLocation());
+            tSink.setTableSchemaJson(getTableSchemaJson());
+            tSink.setDbName(targetTable.getDbName());
+            tSink.setTableName(targetTable.getName());
+            String branch = getBranch();
+            if (branch != null && !branch.isEmpty()) {
+                tSink.setBranch(branch);
+            }
+            tSink.setTableOptions(buildRustWriterOptions());
+        } else {
+            tSink.setBackendType(TPaimonWriteBackendType.JNI);
+        }
+
         if (isChangelogWrite()) {
             tSink.setWriteMode(TPaimonWriteMode.CHANGELOG);
         } else if (ctx.isOverwrite()) {
@@ -145,6 +187,101 @@ public class PaimonTableSink extends BaseExternalTableDataSink {
 
         tDataSink = new TDataSink(TDataSinkType.PAIMON_TABLE_SINK);
         tDataSink.setPaimonTableSink(tSink);
+    }
+
+    /// Storage/credential options for the native writer's FileIO layer,
+    /// mirroring what PaimonScanNode sends the rust reader: vended-credential
+    /// storage properties flattened to backend keys, plus the JDBC-metastore
+    /// paimon options.
+    private Map<String, String> buildRustWriterOptions() {
+        Map<String, String> options = new HashMap<>();
+        if (!(targetTable.getCatalog() instanceof PaimonExternalCatalog)) {
+            return options;
+        }
+        PaimonExternalCatalog catalog = (PaimonExternalCatalog) targetTable.getCatalog();
+        Map<StorageProperties.Type, StorageProperties> storageMap =
+                VendedCredentialsFactory.getStoragePropertiesMapWithVendedCredentials(
+                        catalog.getCatalogProperty().getMetastoreProperties(),
+                        catalog.getCatalogProperty().getStoragePropertiesMap(),
+                        writeTarget.getTable());
+        options.putAll(CredentialUtils.getBackendPropertiesFromStorageMap(storageMap));
+        // Path-style resolution for the native writer. CredentialUtils emits only
+        // its fixed backend key set and defaults use_path_style to "false", but
+        // the Java SDK (the JNI writer's S3FileIO) additionally reads the
+        // s3.path.style.access / fs.s3a.path.style.access spellings straight
+        // from the catalog properties — so a MinIO catalog written the Java way
+        // has no effect on the native writer, which then builds virtual-host
+        // URLs and fails. Forward any recognized spelling from the raw catalog
+        // properties; an already-true backend value keeps winning.
+        for (String key : Arrays.asList("use_path_style", "s3.path-style-access",
+                "s3.path.style.access", "fs.s3a.path.style.access")) {
+            String value = catalog.getCatalogProperty().getProperties().get(key);
+            if (Boolean.parseBoolean(value)
+                    && !Boolean.parseBoolean(options.get("use_path_style"))) {
+                options.put("use_path_style", "true");
+            }
+        }
+        if (catalog.getCatalogProperty().getMetastoreProperties()
+                instanceof PaimonJdbcMetaStoreProperties) {
+            options.putAll(((PaimonJdbcMetaStoreProperties)
+                    catalog.getCatalogProperty().getMetastoreProperties())
+                    .getBackendPaimonOptions());
+        }
+        return options;
+    }
+
+    /// Whether this write can go through the native (paimon-rust) writer.
+    ///
+    /// The native writer has no changelog producer and no bucket/partition
+    /// planning of its own, so every case the Rust ABI cannot express has to
+    /// stay on JNI. The reader applies the same style of pre-flight gating
+    /// (PaimonScanNode) rather than failing at BE open time.
+    private boolean useRustFfiWriter(PaimonInsertCommandContext ctx) {
+        // Explicit opt-in only: the JNI writer is the default everywhere.
+        if (!Boolean.TRUE.equals(ctx.getEnableRustWriter())) {
+            return false;
+        }
+        // The Rust C ABI only exposes with_overwrite(); an UPDATE/DELETE/MERGE
+        // produces a changelog write, which must go through JNI.
+        if (isChangelogWrite()) {
+            return false;
+        }
+        // Storage schemes the pinned paimon-rust FileIO cannot serve. The
+        // reader gates on the same whitelist; a warehouse outside it would fail
+        // at open with a misleading auth error instead of falling back.
+        String location = getTableLocation();
+        if (location == null) {
+            return false;
+        }
+        int schemeEnd = location.indexOf("://");
+        if (schemeEnd <= 0) {
+            // Scheme-less (bare path / file) warehouses are served natively.
+            return true;
+        }
+        String scheme = location.substring(0, schemeEnd).toLowerCase(Locale.ROOT);
+        return RUST_WRITER_VERIFIED_SCHEMES.contains(scheme);
+    }
+
+    private String getTableLocation() {
+        FileStoreTable table = writeTarget.getTable();
+        return table == null ? null : table.location().toString();
+    }
+
+    /// The FE-resolved TableSchema JSON the BE opens the table with: the same
+    /// encoder the rust reader uses, so reader and writer resolve one schema.
+    private String getTableSchemaJson() {
+        FileStoreTable table = writeTarget.getTable();
+        return table == null ? null : PaimonUtil.encodeTableSchemaToJson(table.schema());
+    }
+
+    /// Paimon branch; null for the canonical "main", which the BE defaults to.
+    private String getBranch() {
+        FileStoreTable table = writeTarget.getTable();
+        if (table == null) {
+            return null;
+        }
+        String branch = CoreOptions.branch(table.schema().options());
+        return Identifier.DEFAULT_MAIN_BRANCH.equals(branch) ? null : branch;
     }
 
     private List<String> outputColumnNames() throws AnalysisException {

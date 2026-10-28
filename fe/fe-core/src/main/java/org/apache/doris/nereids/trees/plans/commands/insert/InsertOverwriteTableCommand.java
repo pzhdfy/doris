@@ -447,6 +447,7 @@ public class InsertOverwriteTableCommand extends Command implements NeedAuditEnc
                     sink.getStaticPartitionKeyValues());
             PaimonInsertCommandContext paimonCtx = new PaimonInsertCommandContext();
             paimonCtx.setOverwrite(true);
+            paimonCtx.setEnableRustWriter(ctx.getSessionVariable().getEnablePaimonRustWriter());
             setStaticPartitionToContext(sink, paimonCtx);
             insertCtx = paimonCtx;
         } else {

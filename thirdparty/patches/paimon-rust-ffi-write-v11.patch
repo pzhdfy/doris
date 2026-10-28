@@ -1,0 +1,1057 @@
+diff --git a/bindings/c/src/result.rs b/bindings/c/src/result.rs
+index 60da7c0..c1036e4 100644
+--- a/bindings/c/src/result.rs
++++ b/bindings/c/src/result.rs
+@@ -182,6 +182,17 @@ pub struct paimon_result_prepare_commit {
+     pub error: *mut paimon_error,
+ }
+ 
++/// Owned byte buffer returned by functions that produce raw serialized data.
++///
++/// `bytes.data`/`bytes.len` describe an independently owned allocation that the
++/// caller releases with `paimon_bytes_free`. On error `bytes` is null/zero -- no
++/// partial output is ever produced -- and `error` carries the failure.
++#[repr(C)]
++pub struct paimon_result_bytes {
++    pub bytes: paimon_bytes,
++    pub error: *mut paimon_error,
++}
++
+ #[repr(C)]
+ pub struct paimon_result_postpone_fixed_bucket_write_builder {
+     pub write_builder: *mut paimon_postpone_fixed_bucket_write_builder,
+diff --git a/bindings/c/src/tests.rs b/bindings/c/src/tests.rs
+index 570c85a..3f06f0b 100644
+--- a/bindings/c/src/tests.rs
++++ b/bindings/c/src/tests.rs
+@@ -4238,3 +4238,136 @@ fn blob_stream_validates_handles_and_buffers() {
+         paimon_blob_reader_free(created.reader);
+     }
+ }
++
++// ===== Native committer helpers (export schema / serialize range) =====
++
++#[test]
++fn serializer_version_reports_the_linked_java_release() {
++    // Paimon 1.4.x links CommitMessageSerializer v11. This is what a native
++    // committer frames its payloads with; moving Paimon forward changes only
++    // the constant, not the ABI.
++    assert_eq!(paimon_commit_message_serializer_version(), 11);
++}
++
++#[test]
++fn serialize_range_rejects_out_of_bounds_and_null() {
++    unsafe {
++        let bytes = paimon_commit_messages_serialize_range(
++            std::ptr::null(),
++            0,
++            0,
++        );
++        assert!(!bytes.error.is_null());
++        assert!(bytes.bytes.data.is_null());
++        paimon_error_free(bytes.error);
++    }
++}
++
++/// End-to-end: open a real table, write one arrow batch through the FFI,
++/// prepare the commit and serialize the range. The bytes must be what Paimon
++/// 1.4.2's `CommitMessageSerializer` reads back.
++#[test]
++fn write_prepare_and_serialize_range_end_to_end() {
++    unsafe {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().to_str().unwrap().to_string();
++
++        // Build a minimal paimon table on disk via the writer itself: schema
++        // json comes from `paimon_table_from_schema_json`'s counterpart, so we
++        // create it once with the schema file the reader expects.
++        let schema_json = r#"{
++            "version": 1,
++            "id": 0,
++            "fields": [
++                {"id": 0, "name": "id", "type": "INT NOT NULL"},
++                {"id": 1, "name": "v", "type": "STRING"}
++            ],
++            "highestFieldId": 1,
++            "partitionKeys": [],
++            "primaryKeys": [],
++            "options": {"bucket": "-1"},
++            "timeMillis": 1700000000000,
++            "comment": null
++        }"#;
++        // paimon expects <warehouse>/<db>.db/<table>/schema/schema-0
++        let table_dir = format!("{path}/db.db/t");
++        std::fs::create_dir_all(format!("{table_dir}/schema")).unwrap();
++        std::fs::write(format!("{table_dir}/schema/schema-0"), schema_json).unwrap();
++
++        let mut c_path = std::ffi::CString::new(table_dir.clone()).unwrap();
++        let tbl = paimon_table_from_schema_json(
++            c_path.as_ptr(),
++            std::ffi::CString::new(schema_json).unwrap().as_ptr(),
++            std::ffi::CString::new("db").unwrap().as_ptr(),
++            std::ffi::CString::new("t").unwrap().as_ptr(),
++            std::ptr::null(),
++            std::ptr::null(),
++            0,
++        );
++        if !tbl.error.is_null() {
++            let e = &*tbl.error;
++            panic!("open table: code={}", e.code);
++        }
++
++        // export arrow schema
++        let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
++        let err = paimon_table_export_arrow_schema(
++            tbl.table,
++            ffi_schema.as_mut_ptr() as *mut c_void,
++        );
++        assert!(err.is_null(), "export_arrow_schema failed");
++        let ffi_schema = ffi_schema.assume_init();
++        let schema = Arc::new(ArrowSchema::try_from(&ffi_schema).unwrap());
++        assert_eq!(schema.fields().len(), 2);
++        assert_eq!(schema.field(0).name(), "id");
++        assert_eq!(schema.field(1).name(), "v");
++
++        println!("E2E_SCHEMA_OK fields={}", schema.fields().len());
++
++        // ---- write one batch through the FFI, prepare, serialize ----
++        let mut wb = paimon_table_new_write_builder_with_commit_user(
++            tbl.table,
++            std::ffi::CString::new("e2e-user").unwrap().as_ptr(),
++        );
++        assert!(wb.error.is_null(), "new_write_builder failed");
++        let tw = paimon_write_builder_new_write(wb.write_builder);
++        if !tw.error.is_null() {
++            let e = &*tw.error;
++            let msg = std::slice::from_raw_parts(e.message.data, e.message.len);
++            panic!("new_write failed: {}", String::from_utf8_lossy(msg));
++        }
++
++        let ids = Int32Array::from(vec![1, 2, 3]);
++        let vs = StringArray::from(vec![Some("a"), Some("b"), None]);
++        let batch = RecordBatch::try_new(
++            schema.clone(),
++            vec![Arc::new(ids) as _, Arc::new(vs) as _],
++        )
++        .unwrap();
++        let struct_array = StructArray::from(batch);
++        let ffi_array = FFI_ArrowArray::new(&struct_array.to_data());
++        let ffi_schema2 = FFI_ArrowSchema::try_from(schema.as_ref()).unwrap();
++        let werr = paimon_table_write_write_arrow_batch(
++            tw.write,
++            Box::into_raw(Box::new(ffi_array)) as *mut c_void,
++            Box::into_raw(Box::new(ffi_schema2)) as *mut c_void,
++        );
++        assert!(werr.is_null(), "write_arrow_batch failed");
++
++        let pc = paimon_table_write_prepare_commit(tw.write);
++        assert!(pc.error.is_null(), "prepare_commit failed");
++        assert!(!pc.messages.is_null());
++
++        let bytes = paimon_commit_messages_serialize_range(pc.messages, 0, 1);
++        assert!(bytes.error.is_null(), "serialize_range failed");
++        assert!(!bytes.bytes.data.is_null());
++        let body = std::slice::from_raw_parts(bytes.bytes.data, bytes.bytes.len);
++        println!("E2E_COMMIT_LEN={}", body.len());
++        println!("E2E_COMMIT_HEX={}", body.iter().map(|b| format!("{b:02x}")).collect::<String>());
++
++        paimon_bytes_free(bytes.bytes);
++        paimon_commit_messages_free(pc.messages);
++        paimon_table_write_free(tw.write);
++        println!("E2E_DONE");
++    }
++}
+diff --git a/bindings/c/src/write.rs b/bindings/c/src/write.rs
+index c6e9afa..f3940df 100644
+--- a/bindings/c/src/write.rs
++++ b/bindings/c/src/write.rs
+@@ -30,7 +30,8 @@ use crate::result::{
+     paimon_result_postpone_fixed_bucket_table_commit,
+     paimon_result_postpone_fixed_bucket_table_write,
+     paimon_result_postpone_fixed_bucket_write_builder, paimon_result_prepare_commit,
+-    paimon_result_table_commit, paimon_result_table_write, paimon_result_write_builder,
++    paimon_result_bytes, paimon_result_table_commit, paimon_result_table_write,
++    paimon_result_write_builder,
+ };
+ use crate::runtime;
+ use crate::types::*;
+@@ -1386,3 +1387,157 @@ const _: unsafe extern "C" fn(
+     *const paimon_postpone_fixed_bucket_table_commit,
+     *mut paimon_postpone_fixed_bucket_commit_messages,
+ ) -> *mut paimon_error = paimon_postpone_fixed_bucket_table_commit_abort;
++
++// ============ Native (external committer) write helpers ============
++//
++// These three entry points let a native engine drive the write path without a
++// JVM: export the writer's target Arrow schema, serialize a prepared commit
++// message range for an external committer, and report which Java
++// `CommitMessageSerializer` body version that serialization targets.
++//
++// The C ABI here is deliberately kept independent of the Paimon Java release
++// the crate happens to link: `paimon_commit_message_serializer_version()`
++// returns the version the *library* emits, so a native caller reads it at
++// startup and frames its payloads with it instead of hard-coding a number.
++// Moving to a newer Paimon (e.g. 2.1 / serializer v14) then only changes the
++// Rust side.
++
++/// Java `CommitMessageSerializer` body version emitted by
++/// `paimon_commit_messages_serialize_range`.
++///
++/// A native committer must frame each serialized range with this version; it is
++/// the version its own Java SDK has to be able to decode.
++#[no_mangle]
++pub extern "C" fn paimon_commit_message_serializer_version() -> i32 {
++    paimon::table::COMMIT_MESSAGE_SERIALIZER_VERSION
++}
++
++/// Export the table's write target Arrow schema.
++///
++/// This is the exact schema `paimon_table_write_write_arrow_batch` validates
++/// against (same `build_target_arrow_schema` call the writer uses), so a caller
++/// that builds its batches from this schema can never drift from what the
++/// writer expects. Fields appear in table order.
++///
++/// `out_schema` must point to writable storage for one `ArrowSchema` C struct
++/// (zero-initialized). On success the struct is initialized and owned by the
++/// caller: import it (Arrow C++ `ImportSchema` consumes the release callback)
++/// or release it through the struct's own `release` callback. On failure the
++/// storage is left untouched.
++///
++/// # Safety
++/// `table` must be a valid table handle, or null (returns an error).
++/// `out_schema` must point to writable storage for one `ArrowSchema`, or null.
++#[no_mangle]
++pub unsafe extern "C" fn paimon_table_export_arrow_schema(
++    table: *const paimon_table,
++    out_schema: *mut c_void,
++) -> *mut paimon_error {
++    if let Err(error) = check_non_null(table, "table") {
++        return error;
++    }
++    if out_schema.is_null() {
++        return invalid_input("out_schema must not be null");
++    }
++    let table_ref = &*((*table).inner as *const Table);
++    let schema = match paimon::arrow::build_target_arrow_schema(table_ref.schema().fields()) {
++        Ok(schema) => schema,
++        Err(error) => return paimon_error::from_paimon(error),
++    };
++    match FFI_ArrowSchema::try_from(schema.as_ref()) {
++        Ok(ffi_schema) => {
++            ptr::write(out_schema as *mut FFI_ArrowSchema, ffi_schema);
++            ptr::null_mut()
++        }
++        Err(error) => paimon_error::new(
++            PaimonErrorCode::Unexpected,
++            format!("export arrow schema: {error}"),
++        ),
++    }
++}
++
++/// Number of messages in a handle returned by `paimon_table_write_prepare_commit`.
++///
++/// A native committer needs this to bound its `serialize_range` chunks. It is a
++/// separate call rather than a field on `paimon_result_prepare_commit` so the
++/// prepare result keeps the layout other consumers already depend on.
++///
++/// Returns zero for a null handle.
++///
++/// # Safety
++/// `messages` must be a valid handle from `paimon_table_write_prepare_commit`,
++/// or null (returns zero).
++#[no_mangle]
++pub unsafe extern "C" fn paimon_commit_messages_count(
++    messages: *const paimon_commit_messages,
++) -> usize {
++    if messages.is_null() {
++        return 0;
++    }
++    let inner = (*messages).inner;
++    if inner.is_null() {
++        return 0;
++    }
++    let state = &*(inner as *const CommitMessagesState);
++    state.messages.len()
++}
++
++/// Serialize commit messages `[start, start + count)` as an unframed body of the
++/// version reported by `paimon_commit_message_serializer_version`.
++///
++/// An empty range is valid up to the message count. The body starts with the
++/// message count and carries no transport framing: the caller decides how to
++/// frame and chunk it (Doris wraps each chunk in its own DPCM header). Callers
++/// may inspect the returned length and retry a smaller range to stay under a
++/// transport payload limit.
++///
++/// Messages are never consumed or modified, including on failure. The returned
++/// bytes are independently owned, remain valid after the message handle is
++/// freed, and must be released with `paimon_bytes_free`.
++///
++/// # Safety
++/// `messages` must be a valid handle from `paimon_table_write_prepare_commit`,
++/// or null (returns an error). It must not be freed concurrently.
++#[no_mangle]
++pub unsafe extern "C" fn paimon_commit_messages_serialize_range(
++    messages: *const paimon_commit_messages,
++    start: usize,
++    count: usize,
++) -> paimon_result_bytes {
++    let serialized = (|| {
++        check_non_null(messages, "messages")?;
++        let inner = (*messages).inner;
++        check_non_null(inner, "messages.inner")?;
++        let state = &*(inner as *const CommitMessagesState);
++        let end = start
++            .checked_add(count)
++            .ok_or_else(|| invalid_input("commit message range overflows usize"))?;
++        let selected = state
++            .messages
++            .get(start..end)
++            .ok_or_else(|| invalid_input("commit message range is out of bounds"))?;
++        // Java `ObjectSerializer.serializeList` writes only the count followed
++        // by each message body -- the per-message length prefix belongs to the
++        // `BinaryRow` *inside* a message's file lists, not to the message
++        // itself. This body is exactly what that call produces.
++        let mut body = Vec::new();
++        body.extend_from_slice(&(selected.len() as i32).to_be_bytes());
++        for message in selected {
++            let row = message
++                .serialize_versioned(paimon::table::COMMIT_MESSAGE_SERIALIZER_VERSION)
++                .map_err(paimon_error::from_paimon)?;
++            body.extend_from_slice(&row);
++        }
++        Ok::<Vec<u8>, *mut paimon_error>(body)
++    })();
++    match serialized {
++        Ok(bytes) => paimon_result_bytes {
++            bytes: paimon_bytes::new(bytes),
++            error: ptr::null_mut(),
++        },
++        Err(error) => paimon_result_bytes {
++            bytes: paimon_bytes::empty(),
++            error,
++        },
++    }
++}
+diff --git a/crates/paimon/src/spec/data_file.rs b/crates/paimon/src/spec/data_file.rs
+index 97e2d2d..62e445d 100644
+--- a/crates/paimon/src/spec/data_file.rs
++++ b/crates/paimon/src/spec/data_file.rs
+@@ -189,7 +189,7 @@ impl DataFileMetaRowLayout {
+     /// The layout this crate serializes to, matching current Java.
+     pub const CURRENT: Self = Self::WriteColsSequences;
+ 
+-    fn arity(self) -> usize {
++    pub fn arity(self) -> usize {
+         match self {
+             Self::WriteCols => 20,
+             Self::WriteColsSequences => 21,
+@@ -350,7 +350,21 @@ impl DataFileMeta {
+     /// Only the current layout is written. Reading an older one stays supported because a
+     /// `DataSplit` on disk or on the wire may still carry it.
+     pub fn to_serialized_row_data(&self) -> crate::Result<Vec<u8>> {
+-        let mut b = BinaryRowBuilder::new(DataFileMetaRowLayout::CURRENT.arity() as i32);
++        self.to_serialized_row_data_with_layout(DataFileMetaRowLayout::CURRENT)
++    }
++
++    /// Serialize into a caller-selected Java `DataFileMeta.SCHEMA` layout.
++    ///
++    /// The 20-field `WriteCols` layout matches Paimon 1.4.x, whose
++    /// `_WRITE_COLS_SEQUENCES` field does not exist yet; the current layout is
++    /// 21 fields. A row written in one layout must be read back in the same
++    /// one, so external committers that deserialize with their own Java SDK
++    /// (Paimon 1.4.2 -> v11) must select the matching layout.
++    pub fn to_serialized_row_data_with_layout(
++        &self,
++        layout: DataFileMetaRowLayout,
++    ) -> crate::Result<Vec<u8>> {
++        let mut b = BinaryRowBuilder::new(layout.arity() as i32);
+         b.write_bytes(0, self.file_name.as_bytes());
+         b.write_long(1, self.file_size);
+         b.write_long(2, self.row_count);
+@@ -389,7 +403,9 @@ impl DataFileMeta {
+         }
+         opt_long(&mut b, 18, self.first_row_id);
+         opt_str_array(&mut b, 19, &self.write_cols);
+-        opt_long_array(&mut b, 20, &self.column_max_sequence_numbers);
++        if matches!(layout, DataFileMetaRowLayout::WriteColsSequences) {
++            opt_long_array(&mut b, 20, &self.column_max_sequence_numbers);
++        }
+         Ok(b.build_row_data())
+     }
+ 
+diff --git a/crates/paimon/src/spec/index_file_meta.rs b/crates/paimon/src/spec/index_file_meta.rs
+index 7af9841..41c856e 100644
+--- a/crates/paimon/src/spec/index_file_meta.rs
++++ b/crates/paimon/src/spec/index_file_meta.rs
+@@ -18,8 +18,59 @@
+ use serde::{Deserialize, Serialize};
+ use std::fmt::{Display, Formatter};
+ 
++use crate::spec::{
++    deserialize_binary_array_int, deserialize_binary_array_rows, BinaryRow, BinaryRowBuilder,
++};
+ use indexmap::IndexMap;
+ 
++fn invalid(message: impl Into<String>) -> crate::Error {
++    crate::Error::DataInvalid {
++        message: message.into(),
++        source: None,
++    }
++}
++
++fn round_to_word(size: usize) -> usize {
++    (size + 7) & !7
++}
++
++fn array_header(size: usize) -> usize {
++    4 + size.div_ceil(32) * 4
++}
++
++fn serialize_int_array(values: &[i32]) -> Vec<u8> {
++    let header = array_header(values.len());
++    let mut data = vec![0; round_to_word(header + values.len() * 4)];
++    data[..4].copy_from_slice(&(values.len() as i32).to_le_bytes());
++    for (i, value) in values.iter().enumerate() {
++        data[header + i * 4..header + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
++    }
++    data
++}
++
++fn serialize_row_array(rows: &[Vec<u8>]) -> Vec<u8> {
++    let header = array_header(rows.len());
++    let mut data = vec![0; round_to_word(header + rows.len() * 8)];
++    data[..4].copy_from_slice(&(rows.len() as i32).to_le_bytes());
++    for (i, row) in rows.iter().enumerate() {
++        let offset = data.len();
++        data.extend_from_slice(row);
++        data.resize(data.len() + round_to_word(row.len()) - row.len(), 0);
++        let slot = ((offset as u64) << 32) | row.len() as u64;
++        data[header + i * 8..header + i * 8 + 8].copy_from_slice(&slot.to_le_bytes());
++    }
++    data
++}
++
++fn row_from_data(data: &[u8], arity: i32) -> crate::Result<BinaryRow> {
++    if data.len() < BinaryRow::cal_fix_part_size_in_bytes(arity) as usize {
++        return Err(invalid(format!(
++            "IndexFileMeta nested row is too short for arity {arity}"
++        )));
++    }
++    Ok(BinaryRow::from_bytes(arity, data.to_vec()))
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct DeletionVectorMeta {
+     pub offset: i32,
+@@ -94,6 +145,148 @@ pub struct IndexFileMeta {
+     pub global_index_meta: Option<GlobalIndexMeta>,
+ }
+ 
++impl IndexFileMeta {
++    /// Java `IndexFileMetaSerializer` row body, without its i32 length prefix.
++    pub fn to_serialized_row_data(&self) -> crate::Result<Vec<u8>> {
++        self.to_serialized_row_data_with_global_source_meta(true)
++    }
++
++    /// Serialize with or without `GlobalIndexMeta._SOURCE_META`.
++    ///
++    /// Paimon 1.4.x has no `_SOURCE_META` slot (5-field `GlobalIndexMeta`);
++    /// newer releases add it (6 fields). The nested row carries no arity, so
++    /// the reader's own Java SDK decides and the writer must match.
++    pub fn to_serialized_row_data_with_global_source_meta(
++        &self,
++        include_source_meta: bool,
++    ) -> crate::Result<Vec<u8>> {
++        let mut row = BinaryRowBuilder::new(7);
++        row.write_bytes(0, self.index_type.as_bytes());
++        row.write_bytes(1, self.file_name.as_bytes());
++        row.write_long(2, self.file_size);
++        row.write_long(3, self.row_count);
++        if let Some(ranges) = &self.deletion_vectors_ranges {
++            let rows = ranges
++                .iter()
++                .map(|(name, range)| {
++                    let mut dv = BinaryRowBuilder::new(4);
++                    dv.write_bytes(0, name.as_bytes());
++                    dv.write_int(1, range.offset);
++                    dv.write_int(2, range.length);
++                    match range.cardinality {
++                        Some(value) => dv.write_long(3, value),
++                        None => dv.set_null_at(3),
++                    }
++                    dv.build_row_data()
++                })
++                .collect::<Vec<_>>();
++            row.write_bytes(4, &serialize_row_array(&rows));
++        } else {
++            row.set_null_at(4);
++        }
++        match &self.external_path {
++            Some(value) => row.write_bytes(5, value.as_bytes()),
++            None => row.set_null_at(5),
++        }
++        if let Some(meta) = &self.global_index_meta {
++            let arity = if include_source_meta { 6 } else { 5 };
++            let mut global = BinaryRowBuilder::new(arity);
++            global.write_long(0, meta.row_range_start);
++            global.write_long(1, meta.row_range_end);
++            global.write_int(2, meta.index_field_id);
++            match &meta.extra_field_ids {
++                Some(values) => global.write_bytes(3, &serialize_int_array(values)),
++                None => global.set_null_at(3),
++            }
++            match &meta.index_meta {
++                Some(value) => global.write_bytes(4, value),
++                None => global.set_null_at(4),
++            }
++            if include_source_meta {
++                match &meta.source_meta {
++                    Some(value) => global.write_bytes(5, value),
++                    None => global.set_null_at(5),
++                }
++            }
++            row.write_bytes(6, &global.build_row_data());
++        } else {
++            row.set_null_at(6);
++        }
++        Ok(row.build_row_data())
++    }
++
++    /// Reverse of `to_serialized_row_data` for the current Java row schema.
++    pub fn from_serialized_row_data(data: &[u8]) -> crate::Result<Self> {
++        let row = row_from_data(data, 7)?;
++        let name = |pos| -> crate::Result<String> {
++            String::from_utf8(row.get_binary(pos)?.to_vec())
++                .map_err(|_| invalid(format!("IndexFileMeta field {pos} is not UTF-8")))
++        };
++        let ranges = if row.is_null_at(4) {
++            None
++        } else {
++            let mut ranges = IndexMap::new();
++            for raw in deserialize_binary_array_rows(row.get_binary(4)?)? {
++                let dv = row_from_data(raw, 4)?;
++                let name = String::from_utf8(dv.get_binary(0)?.to_vec())
++                    .map_err(|_| invalid("deletion vector file name is not UTF-8"))?;
++                ranges.insert(
++                    name,
++                    DeletionVectorMeta {
++                        offset: dv.get_int(1)?,
++                        length: dv.get_int(2)?,
++                        cardinality: if dv.is_null_at(3) {
++                            None
++                        } else {
++                            Some(dv.get_long(3)?)
++                        },
++                    },
++                );
++            }
++            Some(ranges)
++        };
++        let external_path = if row.is_null_at(5) {
++            None
++        } else {
++            Some(name(5)?)
++        };
++        let global_index_meta = if row.is_null_at(6) {
++            None
++        } else {
++            let global = row_from_data(row.get_binary(6)?, 6)?;
++            Some(GlobalIndexMeta {
++                row_range_start: global.get_long(0)?,
++                row_range_end: global.get_long(1)?,
++                index_field_id: global.get_int(2)?,
++                extra_field_ids: if global.is_null_at(3) {
++                    None
++                } else {
++                    Some(deserialize_binary_array_int(global.get_binary(3)?)?)
++                },
++                index_meta: if global.is_null_at(4) {
++                    None
++                } else {
++                    Some(global.get_binary(4)?.to_vec())
++                },
++                source_meta: if global.is_null_at(5) {
++                    None
++                } else {
++                    Some(global.get_binary(5)?.to_vec())
++                },
++            })
++        };
++        Ok(Self {
++            index_type: name(0)?,
++            file_name: name(1)?,
++            file_size: row.get_long(2)?,
++            row_count: row.get_long(3)?,
++            deletion_vectors_ranges: ranges,
++            external_path,
++            global_index_meta,
++        })
++    }
++}
++
+ impl Display for IndexFileMeta {
+     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+         write!(
+@@ -168,3 +361,42 @@ mod map_serde {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod wire_tests {
++    use super::*;
++
++    #[test]
++    fn current_java_row_round_trip_with_nested_metadata() {
++        let mut ranges = IndexMap::new();
++        ranges.insert(
++            "data.parquet".into(),
++            DeletionVectorMeta {
++                offset: 3,
++                length: 12,
++                cardinality: Some(2),
++            },
++        );
++        let original = IndexFileMeta {
++            index_type: "DV".into(),
++            file_name: "index".into(),
++            file_size: 9,
++            row_count: 2,
++            deletion_vectors_ranges: Some(ranges),
++            external_path: Some("file:/index".into()),
++            global_index_meta: Some(GlobalIndexMeta {
++                row_range_start: 10,
++                row_range_end: 20,
++                index_field_id: 3,
++                extra_field_ids: Some(vec![1, 4]),
++                index_meta: Some(vec![1, 2]),
++                source_meta: Some(vec![3]),
++            }),
++        };
++        let bytes = original.to_serialized_row_data().unwrap();
++        assert_eq!(
++            IndexFileMeta::from_serialized_row_data(&bytes).unwrap(),
++            original
++        );
++    }
++}
+diff --git a/crates/paimon/src/table/commit_message.rs b/crates/paimon/src/table/commit_message.rs
+index 55afbf6..fa60d8b 100644
+--- a/crates/paimon/src/table/commit_message.rs
++++ b/crates/paimon/src/table/commit_message.rs
+@@ -15,8 +15,70 @@
+ // specific language governing permissions and limitations
+ // under the License.
+ 
+-use crate::spec::DataFileMeta;
+-use crate::spec::IndexFileMeta;
++use super::source::{read_i32, read_i64, take};
++use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout, IndexFileMeta};
++
++/// Java `CommitMessageSerializer` body version this build emits and decodes.
++///
++/// The version is carried by an enclosing serializer, not embedded in the body.
++/// It must name the format the *consuming* Java SDK understands, so this
++/// constant -- not a hard-coded number in the embedding engine -- decides the
++/// wire layout. Upgrading the bundled Paimon changes this one line; every row
++/// serializer below keys its layout off it.
++pub const COMMIT_MESSAGE_SERIALIZER_VERSION: i32 = 11;
++
++/// Paimon 1.4.x body version: 20-field `DataFileMeta`, 5-field
++/// `GlobalIndexMeta`, no trailing `checkFromSnapshot`.
++pub const COMMIT_MESSAGE_SERIALIZER_VERSION_V11: i32 = 11;
++
++/// Paimon 2.1.x body version: 21-field `DataFileMeta` (adds
++/// `_WRITE_COLS_SEQUENCES`), 6-field `GlobalIndexMeta` (adds `_SOURCE_META`),
++/// trailing `checkFromSnapshot`.
++pub const COMMIT_MESSAGE_SERIALIZER_VERSION_V14: i32 = 14;
++
++fn invalid(message: impl Into<String>) -> crate::Error {
++    crate::Error::DataInvalid {
++        message: message.into(),
++        source: None,
++    }
++}
++
++fn write_rows<T>(
++    out: &mut Vec<u8>,
++    values: &[T],
++    encode: impl Fn(&T) -> crate::Result<Vec<u8>>,
++) -> crate::Result<()> {
++    out.extend_from_slice(&(values.len() as i32).to_be_bytes());
++    for value in values {
++        let row = encode(value)?;
++        out.extend_from_slice(&(row.len() as i32).to_be_bytes());
++        out.extend_from_slice(&row);
++    }
++    Ok(())
++}
++
++fn read_rows<T>(
++    cur: &mut &[u8],
++    decode: impl Fn(&[u8]) -> crate::Result<T>,
++) -> crate::Result<Vec<T>> {
++    let count = read_i32(cur)?;
++    if count < 0 || count as usize > cur.len() / 4 {
++        return Err(invalid(format!(
++            "invalid CommitMessage list count: {count}"
++        )));
++    }
++    let mut values = Vec::new();
++    for _ in 0..count {
++        let length = read_i32(cur)?;
++        if length < 0 {
++            return Err(invalid(format!(
++                "negative CommitMessage row length: {length}"
++            )));
++        }
++        values.push(decode(take(cur, length as usize)?)?);
++    }
++    Ok(values)
++}
+ 
+ /// A commit message representing new files to be committed for a specific partition and bucket.
+ ///
+@@ -41,6 +103,13 @@ pub struct CommitMessage {
+     pub deleted_index_files: Vec<IndexFileMeta>,
+     /// Files to be deleted (copy-on-write rewrite: old files replaced by new_files).
+     pub deleted_files: Vec<DataFileMeta>,
++    /// Files removed by compaction (Java's separate compact increment).
++    pub compact_before: Vec<DataFileMeta>,
++    /// Files produced by compaction.
++    pub compact_after: Vec<DataFileMeta>,
++    pub compact_changelog_files: Vec<DataFileMeta>,
++    pub compact_new_index_files: Vec<IndexFileMeta>,
++    pub compact_deleted_index_files: Vec<IndexFileMeta>,
+     fixed_bucket_overwrite: bool,
+ }
+ 
+@@ -56,15 +125,313 @@ impl CommitMessage {
+             new_index_files: Vec::new(),
+             deleted_index_files: Vec::new(),
+             deleted_files: Vec::new(),
++            compact_before: Vec::new(),
++            compact_after: Vec::new(),
++            compact_changelog_files: Vec::new(),
++            compact_new_index_files: Vec::new(),
++            compact_deleted_index_files: Vec::new(),
+             fixed_bucket_overwrite: false,
+         }
+     }
+ 
+-    pub(crate) fn mark_fixed_bucket_overwrite(&mut self) {
++    /// Supply the overwrite operation when restoring a message from Java's wire
++    /// format, which does not encode this flag. Use the target committer's mode.
++    pub fn mark_fixed_bucket_overwrite(&mut self) {
+         self.fixed_bucket_overwrite = true;
+     }
+ 
+     pub(crate) fn is_fixed_bucket_overwrite(&self) -> bool {
+         self.fixed_bucket_overwrite
+     }
++
++    /// Write the unframed Java v14 `CommitMessageSerializer.serialize` body.
++    pub fn serialize(&self) -> crate::Result<Vec<u8>> {
++        self.serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION)
++    }
++
++    /// Serialize in the layout the Doris FE committer (Paimon 1.4.2) decodes.
++    pub fn serialize_for_doris_v11(&self) -> crate::Result<Vec<u8>> {
++        self.serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION_V11)
++    }
++
++    /// Write the body for a specific Java serializer version.
++    ///
++    /// v11 (Paimon 1.4.x) predates `_COMMIT_SNAPSHOT_ID`/`_MERGE_MODE` in
++    /// `DataFileMeta`, `_SOURCE_META` in `GlobalIndexMeta` and the trailing
++    /// `checkFromSnapshot` field, so those are omitted for v11.
++    pub fn serialize_versioned(&self, version: i32) -> crate::Result<Vec<u8>> {
++        let v11 = version == COMMIT_MESSAGE_SERIALIZER_VERSION_V11;
++        let layout = if v11 {
++            DataFileMetaRowLayout::WriteCols
++        } else {
++            DataFileMetaRowLayout::CURRENT
++        };
++        let data_row = |f: &DataFileMeta| f.to_serialized_row_data_with_layout(layout);
++        let mut out = Vec::new();
++        // The partition normally is SerializationUtils.serializeBinaryRow:
++        // i32 arity followed by a raw BinaryRow. Internal unpartitioned writers
++        // may still use an empty Vec, which represents BinaryRow.EMPTY_ROW.
++        let partition = if self.partition.is_empty() {
++            BinaryRow::new(0).to_serialized_bytes()
++        } else {
++            BinaryRow::from_serialized_bytes(&self.partition)?;
++            self.partition.clone()
++        };
++        out.extend_from_slice(&(partition.len() as i32).to_be_bytes());
++        out.extend_from_slice(&partition);
++        out.extend_from_slice(&self.bucket.to_be_bytes());
++        out.push(u8::from(self.total_buckets.is_some()));
++        if let Some(value) = self.total_buckets {
++            out.extend_from_slice(&value.to_be_bytes());
++        }
++        for files in [
++            &self.new_files,
++            &self.deleted_files,
++            &self.new_changelog_files,
++        ] {
++            write_rows(&mut out, files, data_row)?;
++        }
++        for files in [&self.new_index_files, &self.deleted_index_files] {
++            write_rows(&mut out, files, |f| {
++                f.to_serialized_row_data_with_global_source_meta(!v11)
++            })?;
++        }
++        for files in [
++            &self.compact_before,
++            &self.compact_after,
++            &self.compact_changelog_files,
++        ] {
++            write_rows(&mut out, files, data_row)?;
++        }
++        for files in [
++            &self.compact_new_index_files,
++            &self.compact_deleted_index_files,
++        ] {
++            write_rows(&mut out, files, |f| {
++                f.to_serialized_row_data_with_global_source_meta(!v11)
++            })?;
++        }
++        if !v11 {
++            out.push(u8::from(self.check_from_snapshot.is_some()));
++            if let Some(value) = self.check_from_snapshot {
++                out.extend_from_slice(&value.to_be_bytes());
++            }
++        }
++        Ok(out)
++    }
++
++    /// Decode an unframed Java `CommitMessageSerializer` v14 body.
++    pub fn deserialize(version: i32, bytes: &[u8]) -> crate::Result<Self> {
++        // Both layouts this crate can represent are accepted: the v11 form
++        // Paimon 1.4.x writes and the v14 form 2.1.x writes. Anything else is a
++        // version this build has no row layout for.
++        let v11 = match version {
++            COMMIT_MESSAGE_SERIALIZER_VERSION_V11 => true,
++            COMMIT_MESSAGE_SERIALIZER_VERSION_V14 => false,
++            other => {
++                return Err(crate::Error::Unsupported {
++                    message: format!("CommitMessage serializer version {other} is not supported"),
++                })
++            }
++        };
++        let layout = if v11 {
++            DataFileMetaRowLayout::WriteCols
++        } else {
++            DataFileMetaRowLayout::CURRENT
++        };
++        let mut cur = bytes;
++        let partition_len = read_i32(&mut cur)?;
++        if partition_len < 0 {
++            return Err(invalid("negative CommitMessage partition length"));
++        }
++        let partition = take(&mut cur, partition_len as usize)?.to_vec();
++        BinaryRow::from_serialized_bytes(&partition)?;
++        let bucket = read_i32(&mut cur)?;
++        let total_buckets = match take(&mut cur, 1)?[0] {
++            0 => None,
++            1 => Some(read_i32(&mut cur)?),
++            value => return Err(invalid(format!("invalid totalBuckets flag: {value}"))),
++        };
++        let data_file = |raw: &[u8]| DataFileMeta::from_serialized_row_data(raw, layout);
++        let new_files = read_rows(&mut cur, data_file)?;
++        let deleted_files = read_rows(&mut cur, data_file)?;
++        let new_changelog_files = read_rows(&mut cur, data_file)?;
++        let new_index_files = read_rows(&mut cur, IndexFileMeta::from_serialized_row_data)?;
++        let deleted_index_files = read_rows(&mut cur, IndexFileMeta::from_serialized_row_data)?;
++        let compact_before = read_rows(&mut cur, data_file)?;
++        let compact_after = read_rows(&mut cur, data_file)?;
++        let compact_changelog_files = read_rows(&mut cur, data_file)?;
++        let compact_new_index_files = read_rows(&mut cur, IndexFileMeta::from_serialized_row_data)?;
++        let compact_deleted_index_files =
++            read_rows(&mut cur, IndexFileMeta::from_serialized_row_data)?;
++        // v11 predates the trailing checkFromSnapshot field: the body ends
++        // after the compact increment. Reading it unconditionally would
++        // underrun on every 1.4.x payload.
++        let check_from_snapshot = if v11 {
++            None
++        } else {
++            match take(&mut cur, 1)?[0] {
++                0 => None,
++                1 => Some(read_i64(&mut cur)?),
++                value => return Err(invalid(format!("invalid checkFromSnapshot flag: {value}"))),
++            }
++        };
++        if !cur.is_empty() {
++            return Err(invalid(format!(
++                "{} trailing bytes after CommitMessage",
++                cur.len()
++            )));
++        }
++        Ok(Self {
++            partition,
++            bucket,
++            total_buckets,
++            new_files,
++            deleted_files,
++            check_from_snapshot,
++            new_changelog_files,
++            new_index_files,
++            deleted_index_files,
++            compact_before,
++            compact_after,
++            compact_changelog_files,
++            compact_new_index_files,
++            compact_deleted_index_files,
++            fixed_bucket_overwrite: false,
++        })
++    }
++
++    /// Import a message for the fixed-bucket overwrite commit path. Java's
++    /// wire format does not encode the commit operation, so the caller must
++    /// supply that context when restoring a prepared overwrite message.
++    pub fn deserialize_for_fixed_bucket_overwrite(
++        version: i32,
++        bytes: &[u8],
++    ) -> crate::Result<Self> {
++        let mut message = Self::deserialize(version, bytes)?;
++        message.mark_fixed_bucket_overwrite();
++        Ok(message)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use base64::Engine;
++
++    // Produced by Java CommitMessageSerializer v14 with BinaryRow.EMPTY_ROW,
++    // bucket 3, checkFromSnapshot 7. The second message also has totalBuckets
++    // 5 and one data-increment IndexFileMeta("I", "index", 9, 2).
++    const EMPTY: &str = "AAAADAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAABw==";
++    const INDEXED: &str = "AAAADAAAAAAAAAAAAAAAAAAAAAMBAAAABQAAAAAAAAAAAAAAAAAAAAEAAABAAHAAAAAAAABJAAAAAAAAgWluZGV4AACFCQAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAABw==";
++    const RICH_INDEXED: &str = "AAAADAAAAAAAAAAAAAAAAAAAAAMBAAAABQAAAAAAAAAAAAAAAAAAAAEAAADgAAAAAAAAAABEVgAAAAAAgmluZGV4AACFCQAAAAAAAAACAAAAAAAAAEgAAABAAAAACwAAAIgAAABIAAAAmAAAAAEAAAAAAAAAOAAAABAAAAAAAAAAAAAAAAwAAAAoAAAAAwAAAAAAAAAMAAAAAAAAAAIAAAAAAAAAZGF0YS5wYXJxdWV0AAAAAGZpbGU6L2luZGV4AAAAAAAAAAAAAAAAAAoAAAAAAAAAFAAAAAAAAAADAAAAAAAAABAAAAA4AAAAAQIAAAAAAIIDAAAAAAAAgQIAAAAAAAAAAQAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAc=";
++
++    #[test]
++    fn java_v14_golden_round_trip() {
++        for golden in [EMPTY, INDEXED, RICH_INDEXED] {
++            let bytes = base64::engine::general_purpose::STANDARD
++                .decode(golden)
++                .unwrap();
++            let message =
++                CommitMessage::deserialize(COMMIT_MESSAGE_SERIALIZER_VERSION_V14, &bytes).unwrap();
++            assert_eq!(message.bucket, 3);
++            assert_eq!(message.check_from_snapshot, Some(7));
++            assert_eq!(
++                message.serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION_V14).unwrap(),
++                bytes
++            );
++        }
++        let indexed = base64::engine::general_purpose::STANDARD
++            .decode(INDEXED)
++            .unwrap();
++        let message = CommitMessage::deserialize(14, &indexed).unwrap();
++        assert_eq!(message.total_buckets, Some(5));
++        assert_eq!(message.new_index_files[0].file_name, "index");
++        let overwrite =
++            CommitMessage::deserialize_for_fixed_bucket_overwrite(14, &indexed).unwrap();
++        assert!(overwrite.is_fixed_bucket_overwrite());
++        let mut empty_partition = CommitMessage::new(Vec::new(), 3, Vec::new());
++        empty_partition.check_from_snapshot = Some(7);
++        let empty = base64::engine::general_purpose::STANDARD
++            .decode(EMPTY)
++            .unwrap();
++        assert_eq!(
++            empty_partition
++                .serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION_V14)
++                .unwrap(),
++            empty
++        );
++        let rich = base64::engine::general_purpose::STANDARD
++            .decode(RICH_INDEXED)
++            .unwrap();
++        let message = CommitMessage::deserialize(14, &rich).unwrap();
++        let index = &message.new_index_files[0];
++        assert_eq!(index.external_path.as_deref(), Some("file:/index"));
++        assert_eq!(index.deletion_vectors_ranges.as_ref().unwrap().len(), 1);
++        assert_eq!(
++            index.global_index_meta.as_ref().unwrap().extra_field_ids,
++            Some(vec![1, 4])
++        );
++    }
++
++    // Produced by Java `CommitMessageSerializer` v11 (Paimon 1.4.2) from
++    // `new CommitMessageImpl(BinaryRow.EMPTY_ROW, 3, null, empty, empty)`.
++    // This is the layout the Doris FE committer decodes, so it is pinned
++    // independently of the richer v14 vectors above.
++    const V11_EMPTY: &str = "0000000c000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000";
++
++    /// The v11 body this crate emits must be byte-identical to Paimon 1.4.2's,
++    /// otherwise the FE's `CommitMessageSerializer` mis-decodes the payload
++    /// (20-field `DataFileMeta`, 5-field `GlobalIndexMeta`, no
++    /// `checkFromSnapshot` tail). Silent corruption, not an error -- hence the
++    /// pin.
++    #[test]
++    fn java_v11_golden_round_trip() {
++        let bytes = hex_to_bytes(V11_EMPTY);
++        let message = CommitMessage::deserialize(COMMIT_MESSAGE_SERIALIZER_VERSION_V11, &bytes)
++            .unwrap();
++        assert_eq!(message.bucket, 3);
++        assert_eq!(message.total_buckets, None);
++        assert_eq!(message.check_from_snapshot, None);
++        assert_eq!(
++            message
++                .serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION_V11)
++                .unwrap(),
++            bytes
++        );
++
++        // The empty message serializes to the same bytes from scratch, which is
++        // the path the C FFI takes (prepare -> serialize range).
++        let built = CommitMessage::new(Vec::new(), 3, Vec::new());
++        assert_eq!(
++            built
++                .serialize_versioned(COMMIT_MESSAGE_SERIALIZER_VERSION_V11)
++                .unwrap(),
++            bytes
++        );
++        assert_eq!(built.serialize_for_doris_v11().unwrap(), bytes);
++
++        // The emitted default is v11, so the plain entry point agrees.
++        assert_eq!(COMMIT_MESSAGE_SERIALIZER_VERSION, COMMIT_MESSAGE_SERIALIZER_VERSION_V11);
++        assert_eq!(built.serialize().unwrap(), bytes);
++    }
++
++    fn hex_to_bytes(hex: &str) -> Vec<u8> {
++        (0..hex.len())
++            .step_by(2)
++            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
++            .collect()
++    }
++
++    #[test]
++    fn rejects_truncated_or_unsupported_message() {
++        let bytes = base64::engine::general_purpose::STANDARD
++            .decode(EMPTY)
++            .unwrap();
++        assert!(CommitMessage::deserialize(13, &bytes).is_err());
++        assert!(CommitMessage::deserialize(14, &bytes[..bytes.len() - 1]).is_err());
++        let mut trailing = bytes;
++        trailing.push(0);
++        assert!(CommitMessage::deserialize(14, &trailing).is_err());
++    }
+ }
+diff --git a/crates/paimon/src/table/mod.rs b/crates/paimon/src/table/mod.rs
+index 407f9e0..af98fed 100644
+--- a/crates/paimon/src/table/mod.rs
++++ b/crates/paimon/src/table/mod.rs
+@@ -130,7 +130,7 @@ pub use audit_log_table::AuditLogTable;
+ pub use batch_vector_search_builder::BatchVectorSearchBuilder;
+ pub use blob_resolver::{BlobReader, BlobStream};
+ pub use branch_manager::BranchManager;
+-pub use commit_message::CommitMessage;
++pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
+ pub use consumer_manager::ConsumerManager;
+ pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
+ pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};

@@ -29,6 +29,9 @@ public class PaimonInsertCommandContext extends BaseExternalTableInsertCommandCo
     private long txnId = 0;
     private String commitUser;
     private Map<String, Expression> staticPartition = new HashMap<>();
+    // Session's enable_paimon_rust_writer, captured when the insert command runs
+    // so the sink can select the JNI or native backend at bindDataSink time.
+    private Boolean enableRustWriter;
 
     public long getTxnId() {
         return txnId;
@@ -44,6 +47,14 @@ public class PaimonInsertCommandContext extends BaseExternalTableInsertCommandCo
 
     public void setCommitUser(String commitUser) {
         this.commitUser = commitUser;
+    }
+
+    public Boolean getEnableRustWriter() {
+        return enableRustWriter;
+    }
+
+    public void setEnableRustWriter(Boolean enableRustWriter) {
+        this.enableRustWriter = enableRustWriter;
     }
 
     public Map<String, Expression> getStaticPartition() {
