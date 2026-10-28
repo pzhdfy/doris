@@ -1,7 +1,7 @@
 # Paimon Rust FFI 写入移植记档（branch-4.2，doris2）
 
-日期：2026-10-28
-基线：paimon-rust v0.4.0-rc1（社区 tarball）+ 补丁；Paimon Java 1.4.2（CommitMessageSerializer v11）
+日期：2026-10-28（同日完成 paimon-rust v0.5.0-rc1 升级）
+基线：paimon-rust **v0.5.0-rc1**（社区 tarball，MD5 fabf721b…）+ 补丁；Paimon Java 1.4.2（CommitMessageSerializer v11）
 来源：kwai bleem4/bleem 的 rust_ffi 写入功能，按社区 1.4.2 协议重做移植
 
 ## 一、交付物
@@ -54,6 +54,25 @@
 5. 级联断言（数据未落表导致后续 tag 校验失败）：deletion_vector、schema_change、transaction、failures
 
 ## 四、已知边界与待办
+
+### v0.5.0-rc1 升级（2026-10-28 追加）
+
+- `vars.sh` pin 升至 v0.5.0-rc1；patch 重做（6 文件 +501/-44，旧版 1057 行——`mod.rs` 导出、
+  `DataFileMetaRowLayout` 枚举已上游原生）。v11/v14 golden round-trip、C 绑定 88/88 测试全过。
+- 0.5.0 补齐了 v0.4.0 的能力缺口，引入 PR：部分列写入 #1054/#1169、partial-update 引擎
+  #1169、ORC 写格式 #959、rowkind/changelog 记录 #1180（+#1072/#1179/#957 收尾）。
+  changelog 库层面支持（changelog-producer 表选项 + UpdateBefore/After/Delete 记录），但
+  Doris FFI 门控仍按设计把 UPDATE/DELETE/MERGE 路由回 JNI。
+- **升级实战验证了"只改 rust patch"的接口设计**：BE/FE Doris 代码零改动，C ABI 不变。
+- 升级后 33+4 write 套件 FFI 轮失败分布（与 JNI 对照 6 个 variant 环境失败比）：
+  1. variant × 6 —— 环境（Spark 1.4.2 TS 不支持 variant 建表），非 FFI
+  2. **BE 子集列门控 × ~13 —— 我的 BE `build_column_permutation` 在 open() 要求 sink 列覆盖
+     全表字段**；rust 0.5.0 `project_full_write_input` 已支持子集投影+路由，BE 需跟进放开
+     （子集校验 + 按子集构造 Arrow schema 透传）—— 属能力增强，非兼容问题
+  3. ORC 压缩 × 2 —— 0.5.0 ORC writer 仅支持无压缩（zstd/snappy 未接线，`format/mod.rs:602`）
+  4. rowkind 残留 × ~2（source_models / variant_table_modes，`'XX'` row kind 短串校验等，待细查）
+
+### 原始记录（v0.4.0-rc1 阶段）
 
 - [ ] **FE 门控扩展**（建议）：`useRustFfiWriter` 目前只挡 changelog 写；表带 `merge-engine=partial-update` / `file.format=orc` / `rowkind.field` 的普通 INSERT 会走 FFI 后失败。建议加进回退条件自动降级 JNI。
 - [ ] 上述 4 类能力缺口预期由升级 paimon-rust（2.1 + PR 912 路线，重打 patch、版本常量 11→14）补齐；Doris 侧代码无需改动。
