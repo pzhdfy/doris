@@ -268,6 +268,21 @@ public class PaimonTableSink extends BaseExternalTableDataSink {
         if ("orc".equalsIgnoreCase(options.getOrDefault("file.format", "parquet"))) {
             return false;
         }
+        // Batch scans skip level-0 files on these tables (paimon
+        // CoreOptions#batchScanSkipLevel0). The Java writer satisfies that
+        // contract through commit-time lookup compaction; the native writer
+        // publishes plain level-0 files, which then become invisible to every
+        // batch reader, so route to the reference writer instead.
+        if ("first-row".equalsIgnoreCase(options.getOrDefault("merge-engine", "deduplicate"))
+                || Boolean.parseBoolean(options.getOrDefault("deletion-vectors.enabled", "false"))) {
+            return false;
+        }
+        // External data-file directories with a rolling strategy are resolved
+        // by the Java DataFilePathFactory; the pinned paimon-rust writer has no
+        // support for them and writes into the default bucket directory.
+        if (!options.getOrDefault("data-file.external-paths", "").isEmpty()) {
+            return false;
+        }
         if (!table.schema().primaryKeys().isEmpty() && !cols.isEmpty()
                 && !"partial-update".equalsIgnoreCase(
                         options.getOrDefault("merge-engine", "deduplicate"))) {

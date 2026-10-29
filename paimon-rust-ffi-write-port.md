@@ -76,7 +76,33 @@
 
 - [x] FE 门控扩展（`ebd05cf` 已落地）：`rowkind.field`/`changelog-producer` 表、ORC 格式表、PK 非 partial-update 的部分列写均自动回退 JNI（rowkind 残留 2 例 + ORC 2-3 例的已查明根因，回退后即通过）。partial-update 已在 0.5.0 原生支持。
 - [x] null 语义四层对齐（`ebd05cf`）：BE nullable 化输入 schema（镜像 PaimonWriteSchema.java）+ patch 移除 C 绑定层抢先 null 检查 + normalize 重建仅对实际含 null 列放宽 + 补 append 早退分支的 `Cannot write null to non-null column(x)`（Java 连接器 append 写同样拒绝声明 NOT NULL 列的 null；套件负向测试断言该精确文本）。失败演进 19→16→15。
-- [ ] 剩余 9 个非 variant 失败（逐案级，无系统性阻断）：Check tag × 5（first_row 引擎 / bucket_key_dynamic_first_row / dv_post_compact_write_jni / sc_add_after_after_insert——FFI 写后读回数据核对）；append_only 一例 "Cannot write null"（待定位语句）；compaction `expected:<1> but was:<2>` 计数断言；external_paths `expected true got false`；transaction TestAction（待取详情）。
+- [x] 剩余 9 个非 variant 失败——**2026-10-29 已逐案定性（9/9）**，收敛为 5 个根因：
+  - **根因 A：first-row / DV 表 level-0 读不可见（4 案）**。paimon 1.4.2 字节码级确认
+    `CoreOptions#batchScanSkipLevel0()`：`deletion-vectors.enabled=true` 或
+    `merge-engine=first-row` 的表批扫描**跳过全部 level-0 数据文件**（1.4.2 无 merge-on-read 例外）。
+    Java 写端靠提交时 lookup 压缩把数据落成 level≥1 满足该契约；FFI 写 level-0 APPEND 文件
+    → 提交/snapshot/manifest/数据文件全部正确但批读 0 行。受影响：merge_engine(first_row)、
+    bucket_modes(bucket_key_dynamic_first_row)、create_ddl(create_first_row_result)、
+    deletion_vector(dv_post_compact_write_jni，DV 表 compact 后 FFI 新写不可见)。
+    对照实验：同 DDL deduplicate 表 FFI 写读回正常；Java 写 first-row 提交即 level-5 COMPACT。
+    早先"同一会话 vs 不同会话"的表象是干扰项——真正变量是文件是否被 Java 压实过。
+  - **根因 B：Paimon 列 DEFAULT 语义缺失（2 案）**。Java 连接器（PaimonWriteSchema）对
+    **省略**的带 default 列在连接器层填 default；**显式 NULL** 由 paimon writer 的 default
+    wrapper 处理（nullable+default → 替换为 default；NOT NULL → 先拒 null）。FFI 路径两层都
+    没有：append_only(t_append_default 省略 name 被拒 "Cannot write null to non-null
+    column(name)")、schema_change(added_after 显式 NULL 未替换 'unknown'，line 4 mismatch)。
+  - **根因 C：提交时 merge 压缩缺失（compaction 1 案）**。Java writer 两笔 INSERT 两个
+    sorted run 触发 merge-tree compaction 合并为 1 文件；FFI 不做提交时压缩 → 2 个 level-0
+    文件 → `expected:<1> but was:<2>`（读逻辑正确，仅文件形态分叉）。
+  - **根因 D：`data-file.external-paths` 不支持（external_paths 1 案）**。Java
+    DataFilePathFactory 按 round-robin/weight/specific 策略把数据文件写外部目录；rust 无此
+    能力 → 文件落默认 bucket 目录 → 路径断言 false。
+  - **根因 E：`write-buffer-size` 单行上限语义缺失（transaction 1 案）**。Java
+    SortBufferWriteBuffer 拒绝超过 write-buffer-size(256kb) 的单行（"The record exceeds the
+    maximum size of a sort buffer"）；FFI 忽略该配置，1MB 行成功提交 → 预期异常断言失败。
+  - **处置**：FE 门控已扩展（first-row / deletion-vectors.enabled / data-file.external-paths
+    → JNI），覆盖根因 A、D 共 5 案（solo FFI 验证中）；根因 B/C/E 为 rust 侧功能缺口
+    （DEFAULT wrapper、提交时压缩、单行上限检查），记入 rust 待办。
 - **运维事故记录（2026-10-29）**：在 ~/dengfangyuan/doris（2.1 仓库）跑 build.sh 会透过 `doris/output/fe/lib → doris2/output/fe/lib` 软链污染 doris2 的 lib（jar 换成 2.1.0，运行中的 FE 因类路径缺失全崩）并重置 output/be/conf。恢复：重建 doris2（./build.sh --fe --be）→ 从 .bak 恢复 fe.conf/be.conf 真实端口（FE 9630/8620/9610/8630、BE 9660/9650/8640/8660）→ 拷回 output/be/lib/compat/ libstdc++.so.6 → 重启 FE/BE。
 - variant 系列 6 套件失败为 Spark 1.4.2 TS 环境差异，与移植无关（老仓库 + Spark 2.1 才能过）。
 - **运行注意**：`regression-test/conf/regression-conf.groovy` 现为 `enablePaimonTest=true`、`iceberg_spark_thrift_port=11001`（1.4.2 TS）、FE 端口 9630/8630 —— 跑 iceberg 套件前 spark 端口须还原 11000。
