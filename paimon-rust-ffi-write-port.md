@@ -75,7 +75,21 @@
 ### 原始记录（v0.4.0-rc1 阶段）
 
 - [x] FE 门控扩展（`ebd05cf` 已落地）：`rowkind.field`/`changelog-producer` 表、ORC 格式表、PK 非 partial-update 的部分列写均自动回退 JNI（rowkind 残留 2 例 + ORC 2-3 例的已查明根因，回退后即通过）。partial-update 已在 0.5.0 原生支持。
-- [x] null 语义四层对齐（`ebd05cf`）：BE nullable 化输入 schema（镜像 PaimonWriteSchema.java）+ patch 移除 C 绑定层抢先 null 检查 + normalize 重建仅对实际含 null 列放宽 + 补 append 早退分支的 `Cannot write null to non-null column(x)`（Java 连接器 append 写同样拒绝声明 NOT NULL 列的 null；套件负向测试断言该精确文本）。失败演进 19→16→15。
+- [x] null 语义对齐（`ebd05cf` → 当晚重构为 **BE 预检方案**）：BE nullable 化输入 schema
+  （镜像 PaimonWriteSchema.java）；NOT NULL 列 null 拒绝最初落在 crate patch（normalize 放宽
+  + append 早退分支补检查），后按决策**还原全部 crate null 语义改动**，改为 `FfiPaimonWriter::
+  write()` 拼装全列 batch 后、调 rust 前做 BE 预检（`[INVALID_ARGUMENT]Cannot write null to
+  non-null column(x)`，与 Java writer 逐字一致）。crate patch 因此回到 6 文件、仅剩协议层
+  （v11 序列化 + C 绑定导出 + 移除 stock binding 层的抢先 null 检查——stock 该检查以不同
+  文本先拦且会误杀 DELETE 场景，必须移除，这是 patch 中唯一的 null 相关改动）。
+  还原依据（stock 源码逐层核实）：PK 表 stock `filter_write_input` 在 normalize 之前自带
+  同款诊断；append 表 stock 会在 normalize 的 `RecordBatch::try_new` 以 arrow 文本拒绝
+  （BE 预检先行给出 Java 文本）；nullable 列的 NULL（含子集省略）全路径天然通过。
+  **已知限制**：stock normalize 使 partial-update/aggregation 往声明 NOT NULL 列写 NULL
+  （合法"保留旧值"输入）被拒——现有套件无此组合（partial-update 表列全 nullable），
+  遇到时需 FE 门控兜底或恢复该 patch。验证：探针 6/6（append/PK 显式 NULL 拒绝文本、
+  nullable NULL 落表、partial-update 子集两段写保留旧值）；36 套件批失败 10 =
+  6 variant + 4 已知缺口，与还原前分布完全一致。
 - [x] 剩余 9 个非 variant 失败——**2026-10-29 已逐案定性（9/9）**，收敛为 5 个根因：
   - **根因 A：first-row / DV 表 level-0 读不可见（4 案）**。paimon 1.4.2 字节码级确认
     `CoreOptions#batchScanSkipLevel0()`：`deletion-vectors.enabled=true` 或

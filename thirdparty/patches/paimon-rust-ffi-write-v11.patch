@@ -162,7 +162,7 @@ index f445de6..055fb74 100644
 +    }
 +}
 diff --git a/bindings/c/src/write.rs b/bindings/c/src/write.rs
-index dfb0ddd..7b38d65 100644
+index dfb0ddd..d5df073 100644
 --- a/bindings/c/src/write.rs
 +++ b/bindings/c/src/write.rs
 @@ -31,7 +31,8 @@ use crate::result::{
@@ -199,13 +199,13 @@ index dfb0ddd..7b38d65 100644
 -                input.column(index).null_count()
 -            )));
 -        }
-+        // Null values are deliberately not checked here: the crate's write
-+        // path owns nullability validation with the same diagnostics the Java
-+        // connector's writer produces ('Cannot write null to non-null
-+        // column(x)') and the correct DELETE-kind exceptions (a deduplicate
-+        // DELETE may omit non-key values). An import-time null count against
-+        // the target schema would fire first with a different message and
-+        // break both.
++        // Null values are deliberately not checked here: the Doris connector
++        // pre-checks its INSERT batches with the writer's own diagnostic
++        // ('Cannot write null to non-null column(x)') before import, and the
++        // crate's primary-key path re-validates with that same diagnostic and
++        // the correct DELETE-kind exceptions (a deduplicate DELETE may omit
++        // non-key values). An import-time null count against the target schema
++        // would fire first with a different message and break both.
      }
      Ok(())
  }
@@ -771,49 +771,3 @@ index db24ee9..38d90e0 100644
      #[test]
      fn rejects_truncated_or_unsupported_message() {
          let bytes = base64::engine::general_purpose::STANDARD
-diff --git a/crates/paimon/src/table/table_write.rs b/crates/paimon/src/table/table_write.rs
-index 9a18df9..599bf28 100644
---- a/crates/paimon/src/table/table_write.rs
-+++ b/crates/paimon/src/table/table_write.rs
-@@ -896,6 +896,22 @@ impl TableWrite {
-         // Ordinary Arrow append input has no event header. It represents
-         // INSERTs and needs no kind allocation or pre-routing filter.
-         if self.primary_key_indices.is_empty() && self.row_kind_generator.is_none() {
-+            // Declared NOT NULL fields still reject nulls on the append path:
-+            // the Java connector's append writer reports the same diagnostic
-+            // as the primary-key path below, instead of writing the null
-+            // through. Only batches that actually carry nulls are rejected;
-+            // every other batch keeps flowing.
-+            for (index, field) in self.write_schema.fields().iter().enumerate() {
-+                if !field.is_nullable() && batch.column(index).null_count() != 0 {
-+                    return Err(crate::Error::DataInvalid {
-+                        message: format!(
-+                            "Cannot write null to non-null column({})",
-+                            field.name()
-+                        ),
-+                        source: None,
-+                    });
-+                }
-+            }
-             return Ok(None);
-         }
-         // Reject malformed schemas even when every event would be ignored.
-@@ -1124,6 +1140,18 @@ impl TableWrite {
-                     ),
-                     source: Some(Box::new(error)),
-                 })?;
-+            // A null value under a declared NOT NULL field must reach the
-+            // write-path validation below, whose 'Cannot write null to
-+            // non-null column(x)' diagnostic and DELETE-kind exceptions are
-+            // the contract; RecordBatch::try_new would otherwise reject the
-+            // null here first with a different message. Loosen the rebuilt
-+            // field only for batches that actually carry nulls -- every other
-+            // batch keeps the declared nullability.
-+            let field = if !field.is_nullable() && column.null_count() > 0 {
-+                field.with_nullable(true)
-+            } else {
-+                field
-+            };
-             normalized_fields.push(Arc::new(field));
-             normalized_columns.push(column);
-         }

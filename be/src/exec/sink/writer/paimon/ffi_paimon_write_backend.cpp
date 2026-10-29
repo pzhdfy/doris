@@ -492,18 +492,6 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
                 block.columns());
     }
 
-    // Null pre-check with the same message the Java writer produces, so
-    // regression assertions on 'Cannot write null to non-null column(x)' are
-    // backend-agnostic (the Rust-side check exists too but words it
-    // differently). An INSERT-omitted field is null by construction here. A
-    // present field checks its delivered column; has_null() is the column's
-    // SIMD scan.
-    // No null pre-check here, matching the JNI writer: the Java connector
-    // carries explicit NULLs and INSERT-omitted fields through to the Paimon
-    // writer (whose own constraint diagnostics apply), and the stock suites
-    // expect nulls written into NOT NULL columns to land exactly as they do
-    // on the JNI path.
-
     // Convert the Block in its delivered sink order against the sink-order
     // conversion schema, then assemble the full table-order batch the Rust
     // writer validates positionally: present fields take their converted
@@ -534,6 +522,23 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
     std::shared_ptr<arrow::RecordBatch> record_batch =
             arrow::RecordBatch::Make(_batch_schema, sink_batch->num_rows(),
                                      std::move(table_columns));
+
+    // Null pre-check with the exact diagnostic the Java writer produces, so
+    // regression assertions on 'Cannot write null to non-null column(x)' are
+    // backend-agnostic. An INSERT-omitted field is null by construction here;
+    // a present field checks its delivered column. The stock crate's
+    // primary-key path re-validates with the same diagnostic (and the correct
+    // DELETE-kind exceptions), but its append path reports a lower-level
+    // schema error instead, so the check lives here uniformly for every
+    // engine. Nullability comes from the Rust-exported table schema, not the
+    // nullable-ified batch schema this assembly validates against.
+    for (int i = 0; i < _arrow_schema->num_fields(); ++i) {
+        const auto& field = _arrow_schema->field(i);
+        if (!field->nullable() && record_batch->column(i)->null_count() > 0) {
+            return Status::InvalidArgument("Cannot write null to non-null column({})",
+                                           field->name());
+        }
+    }
 
     ArrowArray c_array {};
     ArrowSchema c_schema {};
