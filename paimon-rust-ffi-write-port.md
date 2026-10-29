@@ -64,19 +64,20 @@
   changelog 库层面支持（changelog-producer 表选项 + UpdateBefore/After/Delete 记录），但
   Doris FFI 门控仍按设计把 UPDATE/DELETE/MERGE 路由回 JNI。
 - **升级实战验证了"只改 rust patch"的接口设计**：BE/FE Doris 代码零改动，C ABI 不变。
-- 升级后 33+4 write 套件 FFI 轮失败分布（与 JNI 对照 6 个 variant 环境失败比）：
-  1. variant × 6 —— 环境（Spark 1.4.2 TS 不支持 variant 建表），非 FFI
-  2. **BE 子集列门控 × ~13 —— 我的 BE `build_column_permutation` 在 open() 要求 sink 列覆盖
-     全表字段**；rust 0.5.0 `project_full_write_input` 已支持子集投影+路由，BE 需跟进放开
-     （子集校验 + 按子集构造 Arrow schema 透传）—— 属能力增强，非兼容问题
-  3. ORC 压缩 × 2 —— 0.5.0 ORC writer 仅支持无压缩（zstd/snappy 未接线，`format/mod.rs:602`）
-  4. rowkind 残留 × ~2（source_models / variant_table_modes，`'XX'` row kind 短串校验等，待细查）
+- 升级后 FFI 轮失败演进：23（v0.4.0）→ 19（v0.5.0 + BE 子集列增强 `81ffb54`：置换放宽 +
+  sink 序转换 + 缺列 MakeArrayOfNull + 移除 null 预检——Java 连接器并无该预检，且套件期望
+  省略列落表 \N）。翻绿 ~12 套件；rust_ffi/impl_parity 保持全绿。JNI 基准实测：
+  append 表省略列真实落 NULL；PK/deduplicate 部分列写被 Java 拒绝（requires partial-update）。
+- 最终失败分布（19）：variant×6（环境）；ORC zstd×2-3（0.5.0 ORC 仅无压缩）；
+  rowkind×2（`rowkind.field`/changelog-producer 表的普通 INSERT 到达 rust RowKindGenerator
+  时 kind 为 null——FE 门控应把这类表回退 JNI）；~8 个引擎特有 null 语义断言待逐个核对。
 
 ### 原始记录（v0.4.0-rc1 阶段）
 
-- [ ] **FE 门控扩展**（建议）：`useRustFfiWriter` 目前只挡 changelog 写；表带 `merge-engine=partial-update` / `file.format=orc` / `rowkind.field` 的普通 INSERT 会走 FFI 后失败。建议加进回退条件自动降级 JNI。
-- [ ] 上述 4 类能力缺口预期由升级 paimon-rust（2.1 + PR 912 路线，重打 patch、版本常量 11→14）补齐；Doris 侧代码无需改动。
-- [ ] variant 系列 6 套件失败为 Spark 1.4.2 TS 环境差异，与移植无关（老仓库 + Spark 2.1 才能过）。
+- [ ] **FE 门控扩展**（下一项）：`useRustFfiWriter` 目前只挡 changelog 写；`rowkind.field`/`changelog-producer` 表的普通 INSERT 会走 FFI 后在 rust RowKindGenerator 处报 kind null/非法（rowkind 残留 2 例的已查明根因）——应把这类表加进回退条件自动降级 JNI；`file.format=orc` 压缩表同理（0.5.0 ORC 仅无压缩）。partial-update 已在 0.5.0 原生支持，无需门控。
+- [ ] ~8 个引擎特有 null 语义断言（bucket_modes 动态 first_row、deletion_vector 压缩后、schema_change 等）需逐个与 Java 行为核对。
+- **运维事故记录（2026-10-29）**：在 ~/dengfangyuan/doris（2.1 仓库）跑 build.sh 会透过 `doris/output/fe/lib → doris2/output/fe/lib` 软链污染 doris2 的 lib（jar 换成 2.1.0，运行中的 FE 因类路径缺失全崩）并重置 output/be/conf。恢复：重建 doris2（./build.sh --fe --be）→ 从 .bak 恢复 fe.conf/be.conf 真实端口（FE 9630/8620/9610/8630、BE 9660/9650/8640/8660）→ 拷回 output/be/lib/compat/ libstdc++.so.6 → 重启 FE/BE。
+- variant 系列 6 套件失败为 Spark 1.4.2 TS 环境差异，与移植无关（老仓库 + Spark 2.1 才能过）。
 - **运行注意**：`regression-test/conf/regression-conf.groovy` 现为 `enablePaimonTest=true`、`iceberg_spark_thrift_port=11001`（1.4.2 TS）、FE 端口 9630/8630 —— 跑 iceberg 套件前 spark 端口须还原 11000。
 - **未跑范围**：全量 BE/FE UT（仅跑了 Paimon 相关目标）；`paimon/write/` 以外的 paimon 套件（读路径未改动，理论不受影响）。
 
