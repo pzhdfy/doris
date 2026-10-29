@@ -48,6 +48,22 @@ namespace doris {
 
 namespace {
 
+// A copy of the schema with every field nullable: the input's nullability is
+// independent from the target table constraint, exactly as the JNI connector
+// declares its input fields (PaimonWriteSchema.java: "Input nullability is
+// independent from the target table constraint"). Explicit NULLs and
+// INSERT-omitted null-filled columns flow through to the Paimon writer, which
+// returns its own constraint diagnostics; the Arrow assembly itself must not
+// reject them first.
+std::shared_ptr<arrow::Schema> nullable_input_schema(const arrow::Schema& schema) {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    fields.reserve(schema.num_fields());
+    for (const auto& field : schema.fields()) {
+        fields.push_back(field->WithNullable(true));
+    }
+    return arrow::schema(std::move(fields));
+}
+
 // ---------------------------------------------------------------------------
 // RAII wrappers over the paimon-rust C handles (same pattern as
 // PaimonRustTableReader). Each handle is an opaque pointer owned by Rust and
@@ -352,7 +368,7 @@ Status FfiPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* s
                     sink.column_names[j]);
         }
         sink_fields.push_back(
-                arrow_schema->field(static_cast<int>(sink_to_table[j])));
+                arrow_schema->field(static_cast<int>(sink_to_table[j]))->WithNullable(true));
     }
     std::shared_ptr<arrow::Schema> convertor_schema = arrow::schema(std::move(sink_fields));
 
@@ -449,6 +465,7 @@ FfiPaimonWriter::FfiPaimonWriter(FfiPaimonTableWritePtr table_write,
           _arrow_block_convertor(convertor_schema, timezone),
           _arrow_schema(std::move(arrow_schema)),
           _convertor_schema(std::move(convertor_schema)),
+          _batch_schema(nullable_input_schema(*_arrow_schema)),
           _column_permutation(std::move(column_permutation)),
           _timezone(timezone) {}
 
@@ -515,7 +532,7 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
         table_columns.push_back(std::move(null_array).ValueOrDie());
     }
     std::shared_ptr<arrow::RecordBatch> record_batch =
-            arrow::RecordBatch::Make(_arrow_schema, sink_batch->num_rows(),
+            arrow::RecordBatch::Make(_batch_schema, sink_batch->num_rows(),
                                      std::move(table_columns));
 
     ArrowArray c_array {};

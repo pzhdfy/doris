@@ -246,13 +246,45 @@ public class PaimonTableSink extends BaseExternalTableDataSink {
         if (isChangelogWrite()) {
             return false;
         }
+        FileStoreTable table = writeTarget.getTable();
+        if (table == null) {
+            return false;
+        }
+        // Table configurations the Rust write path cannot express. Row kinds
+        // reach the Rust writer only through the changelog write already routed
+        // to JNI above, so a plain INSERT into a rowkind.field or
+        // changelog-producer table arrives at the Rust RowKindGenerator without
+        // a kind value and fails; ORC tables default to a compressed write the
+        // pinned paimon-rust ORC writer (uncompressed-only) rejects; and a
+        // subset-column INSERT into a primary-key table without
+        // merge-engine=partial-update is rejected by the Java writer with its
+        // engine diagnostic -- route there rather than diverging. Fall back to
+        // JNI in every case: the JNI writer is the reference behavior.
+        Map<String, String> options = table.schema().options();
+        if (!options.getOrDefault("rowkind.field", "").isEmpty()
+                || !"none".equalsIgnoreCase(options.getOrDefault("changelog-producer", "none"))) {
+            return false;
+        }
+        if ("orc".equalsIgnoreCase(options.getOrDefault("file.format", "parquet"))) {
+            return false;
+        }
+        if (!table.schema().primaryKeys().isEmpty() && !cols.isEmpty()
+                && !"partial-update".equalsIgnoreCase(
+                        options.getOrDefault("merge-engine", "deduplicate"))) {
+            Set<String> fields = table.schema().fieldNames().stream()
+                    .map(name -> name.toLowerCase(Locale.ROOT))
+                    .collect(java.util.stream.Collectors.toSet());
+            boolean subset = cols.stream()
+                    .anyMatch(column -> !fields.contains(column.getName().toLowerCase(Locale.ROOT)))
+                    || cols.size() < fields.size();
+            if (subset) {
+                return false;
+            }
+        }
         // Storage schemes the pinned paimon-rust FileIO cannot serve. The
         // reader gates on the same whitelist; a warehouse outside it would fail
         // at open with a misleading auth error instead of falling back.
-        String location = getTableLocation();
-        if (location == null) {
-            return false;
-        }
+        String location = table.location().toString();
         int schemeEnd = location.indexOf("://");
         if (schemeEnd <= 0) {
             // Scheme-less (bare path / file) warehouses are served natively.

@@ -163,8 +163,13 @@ private:
     /// Full table-order schema: the Rust writer's positional contract and the
     /// null pre-check field names come from it.
     std::shared_ptr<arrow::Schema> _arrow_schema;
-    /// Sink-order conversion schema delivered by the Block.
+    /// Sink-order conversion schema delivered by the Block (fields
+    /// nullable-ified, as the JNI connector declares its inputs).
     std::shared_ptr<arrow::Schema> _convertor_schema;
+    /// Nullable-ified full table-order schema the assembled batch validates
+    /// against: INSERT-omitted fields are null-filled, and Arrow rejects null
+    /// columns under the table's own NOT NULL declarations.
+    std::shared_ptr<arrow::Schema> _batch_schema;
     std::vector<size_t> _column_permutation;
     cctz::time_zone _timezone;
 };
