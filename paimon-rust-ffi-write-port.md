@@ -74,8 +74,9 @@
 
 ### 原始记录（v0.4.0-rc1 阶段）
 
-- [ ] **FE 门控扩展**（下一项）：`useRustFfiWriter` 目前只挡 changelog 写；`rowkind.field`/`changelog-producer` 表的普通 INSERT 会走 FFI 后在 rust RowKindGenerator 处报 kind null/非法（rowkind 残留 2 例的已查明根因）——应把这类表加进回退条件自动降级 JNI；`file.format=orc` 压缩表同理（0.5.0 ORC 仅无压缩）。partial-update 已在 0.5.0 原生支持，无需门控。
-- [ ] ~8 个引擎特有 null 语义断言（bucket_modes 动态 first_row、deletion_vector 压缩后、schema_change 等）需逐个与 Java 行为核对。
+- [x] FE 门控扩展（`ebd05cf` 已落地）：`rowkind.field`/`changelog-producer` 表、ORC 格式表、PK 非 partial-update 的部分列写均自动回退 JNI（rowkind 残留 2 例 + ORC 2-3 例的已查明根因，回退后即通过）。partial-update 已在 0.5.0 原生支持。
+- [x] null 语义四层对齐（`ebd05cf`）：BE nullable 化输入 schema（镜像 PaimonWriteSchema.java）+ patch 移除 C 绑定层抢先 null 检查 + normalize 重建仅对实际含 null 列放宽 + 补 append 早退分支的 `Cannot write null to non-null column(x)`（Java 连接器 append 写同样拒绝声明 NOT NULL 列的 null；套件负向测试断言该精确文本）。失败演进 19→16→15。
+- [ ] 剩余 9 个非 variant 失败（逐案级，无系统性阻断）：Check tag × 5（first_row 引擎 / bucket_key_dynamic_first_row / dv_post_compact_write_jni / sc_add_after_after_insert——FFI 写后读回数据核对）；append_only 一例 "Cannot write null"（待定位语句）；compaction `expected:<1> but was:<2>` 计数断言；external_paths `expected true got false`；transaction TestAction（待取详情）。
 - **运维事故记录（2026-10-29）**：在 ~/dengfangyuan/doris（2.1 仓库）跑 build.sh 会透过 `doris/output/fe/lib → doris2/output/fe/lib` 软链污染 doris2 的 lib（jar 换成 2.1.0，运行中的 FE 因类路径缺失全崩）并重置 output/be/conf。恢复：重建 doris2（./build.sh --fe --be）→ 从 .bak 恢复 fe.conf/be.conf 真实端口（FE 9630/8620/9610/8630、BE 9660/9650/8640/8660）→ 拷回 output/be/lib/compat/ libstdc++.so.6 → 重启 FE/BE。
 - variant 系列 6 套件失败为 Spark 1.4.2 TS 环境差异，与移植无关（老仓库 + Spark 2.1 才能过）。
 - **运行注意**：`regression-test/conf/regression-conf.groovy` 现为 `enablePaimonTest=true`、`iceberg_spark_thrift_port=11001`（1.4.2 TS）、FE 端口 9630/8630 —— 跑 iceberg 套件前 spark 端口须还原 11000。
