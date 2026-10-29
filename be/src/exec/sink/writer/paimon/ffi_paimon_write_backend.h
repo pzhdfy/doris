@@ -79,19 +79,25 @@ public:
     ~FfiPaimonWriteBackend() override;
 
     /// Map each table-order Arrow field onto the sink output position carrying
-    /// it: exact name match first, case-insensitive fallback second (Doris
+    /// it, or `kMissingColumn` when the INSERT list omits the field (the writer
+    /// fills omitted fields with null, mirroring the JNI writer's expand-by-name
+    /// writes). Exact name match first, case-insensitive fallback second (Doris
     /// normalizes column names to lowercase, paimon preserves the declared
-    /// case), and a field no sink column covers fails closed by name. A pure
-    /// function of the names, so unit-testable without live FFI handles.
+    /// case). A sink column naming no table field, or naming one twice, fails
+    /// closed by name. A pure function of the names, so unit-testable without
+    /// live FFI handles.
+    static constexpr size_t kMissingColumn = static_cast<size_t>(-1);
     static Status build_column_permutation(const arrow::Schema& schema,
                                            const std::vector<std::string>& sink_column_names,
                                            std::vector<size_t>* permutation);
 
     /// A permutation must name one distinct block position for every table
-    /// field (the Rust writer's schema contract is positional). Empty, short or
-    /// repeating permutations fail closed instead of mis-converting rows.
+    /// field (the Rust writer's schema contract is positional), or
+    /// `kMissingColumn` for INSERT-omitted fields. Empty, short, out-of-range
+    /// or repeating permutations fail closed instead of mis-converting rows.
     static Status validate_permutation(const arrow::Schema& schema,
-                                       const std::vector<size_t>& permutation);
+                                       const std::vector<size_t>& permutation,
+                                       size_t sink_column_count);
 
 private:
     /// The paimon-rust table and write-builder handles, RAII-wrapped (defined
@@ -102,10 +108,16 @@ private:
     struct FfiWriteHandles;
     std::unique_ptr<FfiWriteHandles> _handles;
     std::shared_ptr<arrow::Schema> _arrow_schema;
-    /// Table-order field -> Block column position, computed in open() from
-    /// sink.column_names. Copied (never moved) into each create_writer()
-    /// writer so repeated writers all get the full mapping.
+    /// The Rust writer validates its input positionally against the full table
+    /// schema, so this maps each table-order field to the sink position
+    /// carrying it (or kMissingColumn when the INSERT list omits it, filled
+    /// with null on the Arrow assembly in write()). Copied (never moved) into
+    /// each create_writer() writer so repeated writers all get the full
+    /// mapping.
     std::vector<size_t> _column_permutation;
+    /// The Arrow fields in delivered sink order (the subset the INSERT's
+    /// column list produces), used as the Block->Arrow conversion schema.
+    std::shared_ptr<arrow::Schema> _convertor_schema;
     /// Session timezone, captured in open() and reused by every writer adapter
     /// (the JNI backend does the same): the Arrow conversion of TIMESTAMP
     /// columns depends on it, and write() must not re-read it per batch.
@@ -124,9 +136,13 @@ public:
     /// The backend owns the table/write-builder handles and outlives this
     /// adapter; the TableWrite handle is created per writer and freed when this
     /// adapter is destroyed (abort() drops it early to discard staged files).
-    /// `column_permutation` maps each Arrow schema (table-order) field to the
-    /// position its column occupies in the Doris Block.
+    /// `convertor_schema` is the sink-order field subset the Block delivers
+    /// (the conversion schema); `arrow_schema` is the full table-order schema
+    /// the Rust writer validates against; `column_permutation` maps each
+    /// table-order field to its sink position, or kMissingColumn for
+    /// INSERT-omitted fields.
     explicit FfiPaimonWriter(FfiPaimonTableWritePtr table_write,
+                             std::shared_ptr<arrow::Schema> convertor_schema,
                              std::shared_ptr<arrow::Schema> arrow_schema,
                              std::vector<size_t> column_permutation, cctz::time_zone timezone);
     ~FfiPaimonWriter() override;
@@ -144,7 +160,11 @@ private:
     FfiPaimonTableWritePtr _table_write;
     ArrowMemoryPool<> _arrow_pool;
     paimon::PaimonArrowBlockConvertor _arrow_block_convertor;
+    /// Full table-order schema: the Rust writer's positional contract and the
+    /// null pre-check field names come from it.
     std::shared_ptr<arrow::Schema> _arrow_schema;
+    /// Sink-order conversion schema delivered by the Block.
+    std::shared_ptr<arrow::Schema> _convertor_schema;
     std::vector<size_t> _column_permutation;
     cctz::time_zone _timezone;
 };

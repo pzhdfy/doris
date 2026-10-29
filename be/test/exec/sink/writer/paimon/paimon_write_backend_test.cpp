@@ -37,33 +37,43 @@ TEST(PaimonWriteBackendFactoryTest, SelectBackendType) {
 }
 
 TEST(PaimonWriteBackendFactoryTest, ValidateFfiColumnPermutation) {
-    // A three-field table schema: the permutation must name one distinct block
-    // position per field. Guards the handoff in FfiPaimonWriteBackend::
-    // create_writer(): a moved-out backend member left later writers with an
-    // empty permutation, which must fail closed instead of mis-converting rows.
+    // A three-field table schema: every table field names one distinct sink
+    // position, or kMissingColumn when the INSERT list omits it (the writer
+    // fills omitted fields with null). Empty, short, out-of-range or repeating
+    // permutations fail closed instead of mis-converting rows.
     auto arrow_schema = arrow::schema({arrow::field("id", arrow::int32()),
                                        arrow::field("name", arrow::utf8()),
                                        arrow::field("score", arrow::float64())});
+    constexpr auto missing = FfiPaimonWriteBackend::kMissingColumn;
 
-    EXPECT_TRUE(FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1, 2}).ok());
+    EXPECT_TRUE(FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1, 2}, 3).ok());
     // Out-of-order (INSERT INTO t (b, a)) is a valid mapping.
-    EXPECT_TRUE(FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {2, 0, 1}).ok());
+    EXPECT_TRUE(FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {2, 0, 1}, 3).ok());
+    // INSERT INTO t (score): the two omitted fields are null-filled.
+    EXPECT_TRUE(
+            FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {missing, missing, 0}, 1)
+                    .ok());
 
     // Empty: the moved-out member state.
-    auto status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {});
+    auto status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {}, 0);
     EXPECT_FALSE(status.ok());
     EXPECT_NE(std::string::npos, status.to_string().find("covers 0 of 3"));
 
     // Short permutation.
-    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1});
+    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1}, 2);
     EXPECT_FALSE(status.ok());
 
     // Long permutation.
-    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1, 2, 0});
+    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1, 2, 0}, 4);
     EXPECT_FALSE(status.ok());
 
-    // Repeated block position: two table fields cannot share one column.
-    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 0, 1});
+    // Position beyond the delivered sink columns.
+    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 1, 3}, 3);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(std::string::npos, status.to_string().find("beyond"));
+
+    // Repeated sink position: two table fields cannot share one column.
+    status = FfiPaimonWriteBackend::validate_permutation(*arrow_schema, {0, 0, 1}, 2);
     EXPECT_FALSE(status.ok());
     EXPECT_NE(std::string::npos, status.to_string().find("repeats a block position"));
 }
@@ -74,6 +84,7 @@ TEST(PaimonWriteBackendFactoryTest, BuildFfiColumnPermutation) {
     auto arrow_schema = arrow::schema({arrow::field("id", arrow::int32()),
                                        arrow::field("Name", arrow::utf8()),
                                        arrow::field("score", arrow::float64())});
+    constexpr auto missing = FfiPaimonWriteBackend::kMissingColumn;
 
     std::vector<size_t> permutation;
     // Table order == sink order.
@@ -89,23 +100,31 @@ TEST(PaimonWriteBackendFactoryTest, BuildFfiColumnPermutation) {
                         .ok());
     EXPECT_EQ((std::vector<size_t> {1, 2, 0}), permutation);
 
-    // A table field no sink column covers fails closed, named in the error.
-    auto status = FfiPaimonWriteBackend::build_column_permutation(*arrow_schema,
-                                                                  {"id", "name"}, &permutation);
-    EXPECT_FALSE(status.ok());
-    EXPECT_NE(std::string::npos, status.to_string().find("table field 'score'"));
-
-    // Empty sink columns fail the first field.
-    status = FfiPaimonWriteBackend::build_column_permutation(*arrow_schema, {}, &permutation);
-    EXPECT_FALSE(status.ok());
-    EXPECT_NE(std::string::npos, status.to_string().find("table field 'id'"));
-
-    // An exact match wins over a case-insensitive one: two sink columns that
-    // both fold onto 'Name' must map to the exact spelling's position.
-    ASSERT_TRUE(FfiPaimonWriteBackend::build_column_permutation(
-                        *arrow_schema, {"id", "name", "Name", "score"}, &permutation)
+    // INSERT INTO t (id, name): a subset is allowed; omitted fields (here
+    // score) are null-filled by the writer, mirroring the JNI expand-by-name.
+    ASSERT_TRUE(FfiPaimonWriteBackend::build_column_permutation(*arrow_schema,
+                                                                {"id", "name"}, &permutation)
                         .ok());
-    EXPECT_EQ((std::vector<size_t> {0, 2, 3}), permutation);
+    EXPECT_EQ((std::vector<size_t> {0, 1, missing}), permutation);
+
+    // Empty sink columns map every field to omitted.
+    ASSERT_TRUE(
+            FfiPaimonWriteBackend::build_column_permutation(*arrow_schema, {}, &permutation).ok());
+    EXPECT_EQ((std::vector<size_t> {missing, missing, missing}), permutation);
+
+    // A sink column naming no table field fails closed, named in the error
+    // (mirrors the JNI writer's expand-by-name diagnostic).
+    auto status = FfiPaimonWriteBackend::build_column_permutation(*arrow_schema,
+                                                                  {"id", "payload"}, &permutation);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(std::string::npos, status.to_string().find("'payload' is not in table schema"));
+
+    // A sink column naming one table field twice fails closed, as the JNI
+    // writer's duplicate-column check does.
+    status = FfiPaimonWriteBackend::build_column_permutation(
+            *arrow_schema, {"id", "name", "Name", "score"}, &permutation);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(std::string::npos, status.to_string().find("duplicate write column"));
 }
 
 TEST(JniPaimonWriteBackendTest, OpenAbiAndWriteModes) {

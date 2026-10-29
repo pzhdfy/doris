@@ -19,6 +19,7 @@
 
 #include "exec/sink/writer/paimon/paimon_dpcm_codec.h"
 
+#include <arrow/array/util.h>
 #include <arrow/c/abi.h>
 #include <arrow/c/bridge.h>
 #include <arrow/record_batch.h>
@@ -190,43 +191,62 @@ Status FfiPaimonWriteBackend::build_column_permutation(
         const arrow::Schema& schema, const std::vector<std::string>& sink_column_names,
         std::vector<size_t>* permutation) {
     permutation->clear();
-    permutation->reserve(schema.num_fields());
-    for (int i = 0; i < static_cast<int>(schema.num_fields()); ++i) {
-        const std::string& field = schema.field(i)->name();
-        size_t found = sink_column_names.size();
-        for (size_t j = 0; j < sink_column_names.size(); ++j) {
-            if (sink_column_names[j] == field) {
-                found = j;
+    permutation->assign(schema.num_fields(), kMissingColumn);
+    // Every sink column must name one distinct table field; a table field the
+    // INSERT list omits stays kMissingColumn and the writer fills it with
+    // null, exactly as the JNI writer's expand-by-name writes do.
+    for (size_t j = 0; j < sink_column_names.size(); ++j) {
+        const std::string& column = sink_column_names[j];
+        int found = -1;
+        int found_case_insensitive = -1;
+        for (int i = 0; i < static_cast<int>(schema.num_fields()); ++i) {
+            const std::string& field = schema.field(i)->name();
+            if (field == column) {
+                found = i;
                 break;
             }
-        }
-        if (found == sink_column_names.size()) {
-            for (size_t j = 0; j < sink_column_names.size(); ++j) {
-                if (boost::iequals(sink_column_names[j], field)) {
-                    found = j;
-                    break;
-                }
+            if (found_case_insensitive < 0 && boost::iequals(field, column)) {
+                found_case_insensitive = i;
             }
         }
-        if (found == sink_column_names.size()) {
+        const int table_field = found >= 0 ? found : found_case_insensitive;
+        if (table_field < 0) {
             return Status::InternalError(
-                    "paimon-rust FFI writer sink columns do not cover table field '{}'", field);
+                    "paimon-rust FFI writer sink column '{}' is not in table schema", column);
         }
-        permutation->push_back(found);
+        if ((*permutation)[table_field] != kMissingColumn) {
+            return Status::InternalError(
+                    "paimon-rust FFI writer duplicate write column '{}'", column);
+        }
+        (*permutation)[table_field] = j;
     }
     return Status::OK();
 }
 
 Status FfiPaimonWriteBackend::validate_permutation(const arrow::Schema& schema,
-                                                   const std::vector<size_t>& permutation) {
+                                                   const std::vector<size_t>& permutation,
+                                                   size_t sink_column_count) {
     if (permutation.size() != static_cast<size_t>(schema.num_fields())) {
         return Status::InternalError(
                 "paimon-rust FFI writer column permutation covers {} of {} table fields",
                 permutation.size(), schema.num_fields());
     }
-    std::vector<size_t> sorted(permutation);
-    std::sort(sorted.begin(), sorted.end());
-    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+    std::vector<size_t> present;
+    present.reserve(permutation.size());
+    for (size_t position : permutation) {
+        if (position == kMissingColumn) {
+            continue;
+        }
+        if (position >= sink_column_count) {
+            return Status::InternalError(
+                    "paimon-rust FFI writer column permutation names block position {} beyond "
+                    "the {} sink columns",
+                    position, sink_column_count);
+        }
+        present.push_back(position);
+    }
+    std::sort(present.begin(), present.end());
+    if (std::adjacent_find(present.begin(), present.end()) != present.end()) {
         return Status::InternalError(
                 "paimon-rust FFI writer column permutation repeats a block position");
     }
@@ -307,10 +327,34 @@ Status FfiPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* s
     // The Rust writer's schema contract is positional against the full table
     // schema, while the sink delivers the Block in sink.column_names order
     // (which follows the INSERT's column list). Map every table-order field to
-    // its Block position so write() can reorder columns before conversion.
+    // its sink position -- kMissingColumn for INSERT-omitted fields -- and
+    // build the sink-order conversion schema the Block converts against; the
+    // omitted fields are filled with null in write(), mirroring the JNI
+    // writer's expand-by-name writes.
     std::vector<size_t> column_permutation;
     RETURN_IF_ERROR(
             build_column_permutation(*arrow_schema, sink.column_names, &column_permutation));
+    std::vector<std::shared_ptr<arrow::Field>> sink_fields;
+    sink_fields.reserve(sink.column_names.size());
+    std::vector<size_t> sink_to_table(sink.column_names.size(), kMissingColumn);
+    for (size_t i = 0; i < column_permutation.size(); ++i) {
+        if (column_permutation[i] != kMissingColumn) {
+            sink_to_table[column_permutation[i]] = i;
+        }
+    }
+    for (size_t j = 0; j < sink_to_table.size(); ++j) {
+        if (sink_to_table[j] == kMissingColumn) {
+            // build_column_permutation maps every sink column onto a table
+            // field; reaching here means the two vectors disagree, which only
+            // a concurrent schema change could produce.
+            return Status::InternalError(
+                    "paimon-rust FFI writer sink column {} has no table field",
+                    sink.column_names[j]);
+        }
+        sink_fields.push_back(
+                arrow_schema->field(static_cast<int>(sink_to_table[j])));
+    }
+    std::shared_ptr<arrow::Schema> convertor_schema = arrow::schema(std::move(sink_fields));
 
     // Step 3: build the write builder. The commit_user travels in the sink
     // payload and is shared by every writer of this plan (FE dedupes commits on
@@ -334,10 +378,19 @@ Status FfiPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* s
     _handles = std::make_unique<FfiWriteHandles>(std::move(table), std::move(write_builder));
     _arrow_schema = std::move(arrow_schema);
     _column_permutation = std::move(column_permutation);
+    _convertor_schema = std::move(convertor_schema);
     _opened = true;
 
+    size_t omitted = 0;
+    for (size_t position : _column_permutation) {
+        if (position == kMissingColumn) {
+            ++omitted;
+        }
+    }
     LOG(INFO) << "Paimon Rust FFI writer opened: table=" << sink.table_location
-              << ", columns=" << sink.column_names.size()
+              << ", columns=" << sink.column_names.size() << " ("
+              << _arrow_schema->num_fields() - omitted << " of " << _arrow_schema->num_fields()
+              << " table fields)"
               << ", write_mode=" << sink.write_mode << ", txn=" << sink.transaction_id;
     return Status::OK();
 }
@@ -359,9 +412,10 @@ Status FfiPaimonWriteBackend::create_writer(std::unique_ptr<IPaimonWriter>* writ
     // Copy, not move: create_writer() is repeatable by design (one TableWrite
     // per writer from the shared builder).
     std::vector<size_t> permutation(_column_permutation);
-    RETURN_IF_ERROR(validate_permutation(*_arrow_schema, permutation));
+    RETURN_IF_ERROR(
+            validate_permutation(*_arrow_schema, permutation, _convertor_schema->num_fields()));
     auto ffi_writer = std::make_unique<FfiPaimonWriter>(
-            FfiPaimonTableWrite::adopt(table_write.release()), _arrow_schema,
+            FfiPaimonTableWrite::adopt(table_write.release()), _convertor_schema, _arrow_schema,
             std::move(permutation), _timezone);
     // Bind the Arrow column writers once, as the JNI path does; a binding
     // failure must surface here rather than on the first batch.
@@ -378,6 +432,7 @@ Status FfiPaimonWriteBackend::close() {
     _handles.reset();
     _arrow_schema.reset();
     _column_permutation.clear();
+    _convertor_schema.reset();
     _opened = false;
     return Status::OK();
 }
@@ -387,11 +442,13 @@ Status FfiPaimonWriteBackend::close() {
 // ---------------------------------------------------------------------------
 
 FfiPaimonWriter::FfiPaimonWriter(FfiPaimonTableWritePtr table_write,
+                                 std::shared_ptr<arrow::Schema> convertor_schema,
                                  std::shared_ptr<arrow::Schema> arrow_schema,
                                  std::vector<size_t> column_permutation, cctz::time_zone timezone)
         : _table_write(std::move(table_write)),
-          _arrow_block_convertor(arrow_schema, timezone),
+          _arrow_block_convertor(convertor_schema, timezone),
           _arrow_schema(std::move(arrow_schema)),
+          _convertor_schema(std::move(convertor_schema)),
           _column_permutation(std::move(column_permutation)),
           _timezone(timezone) {}
 
@@ -410,45 +467,56 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
     if (_table_write == nullptr) {
         return Status::InternalError("paimon-rust FFI writer used after abort");
     }
-    if (_arrow_schema == nullptr || _arrow_schema->num_fields() != block.columns()) {
+    if (_convertor_schema == nullptr || _convertor_schema->num_fields() != block.columns()) {
         return Status::InvalidArgument(
-                "Paimon FFI writer Arrow schema column count does not match Doris Block: "
+                "Paimon FFI writer sink schema column count does not match Doris Block: "
                 "schema={}, block={}",
-                _arrow_schema == nullptr ? 0 : _arrow_schema->num_fields(), block.columns());
-    }
-
-    // Reorder the Block into table order first: the Rust writer validates the
-    // input schema positionally against the full table schema, so a sink whose
-    // output order follows the INSERT's column list (INSERT INTO t (b, a)) must
-    // be permuted before the Arrow conversion.
-    Block table_order_block;
-    for (size_t i = 0; i < _column_permutation.size(); ++i) {
-        table_order_block.insert(block.get_by_position(_column_permutation[i]));
+                _convertor_schema == nullptr ? 0 : _convertor_schema->num_fields(),
+                block.columns());
     }
 
     // Null pre-check with the same message the Java writer produces, so
     // regression assertions on 'Cannot write null to non-null column(x)' are
     // backend-agnostic (the Rust-side check exists too but words it
-    // differently). has_null() is the column's SIMD scan; the base returns
-    // false for non-nullable columns.
+    // differently). An INSERT-omitted field is null by construction here. A
+    // present field checks its delivered column; has_null() is the column's
+    // SIMD scan.
+    // No null pre-check here, matching the JNI writer: the Java connector
+    // carries explicit NULLs and INSERT-omitted fields through to the Paimon
+    // writer (whose own constraint diagnostics apply), and the stock suites
+    // expect nulls written into NOT NULL columns to land exactly as they do
+    // on the JNI path.
+
+    // Convert the Block in its delivered sink order against the sink-order
+    // conversion schema, then assemble the full table-order batch the Rust
+    // writer validates positionally: present fields take their converted
+    // column, INSERT-omitted fields become all-null columns, mirroring the
+    // JNI writer's expand-by-name writes.
+    std::shared_ptr<arrow::RecordBatch> sink_batch;
+    RETURN_IF_ERROR(_arrow_block_convertor.convert_to_arrow(block, &_arrow_pool, &sink_batch));
+
+    std::vector<std::shared_ptr<arrow::Array>> table_columns;
+    table_columns.reserve(_arrow_schema->num_fields());
+    constexpr size_t kMissing = FfiPaimonWriteBackend::kMissingColumn;
     for (int i = 0; i < _arrow_schema->num_fields(); ++i) {
-        if (_arrow_schema->field(i)->nullable()) {
+        if (_column_permutation[i] != kMissing) {
+            table_columns.push_back(
+                    sink_batch->column(static_cast<int>(_column_permutation[i])));
             continue;
         }
-        if (table_order_block.get_by_position(i).column->has_null()) {
-            return Status::InvalidArgument("Cannot write null to non-null column({})",
-                                           _arrow_schema->field(i)->name());
+        auto null_array =
+                arrow::MakeArrayOfNull(_arrow_schema->field(i)->type(), sink_batch->num_rows(),
+                                       static_cast<arrow::MemoryPool*>(&_arrow_pool));
+        if (!null_array.ok()) {
+            return Status::InternalError(
+                    "paimon-rust FFI writer build null column for omitted field '{}' failed: {}",
+                    _arrow_schema->field(i)->name(), null_array.status().ToString());
         }
+        table_columns.push_back(std::move(null_array).ValueOrDie());
     }
-
-    // Doris builds the Arrow batch against the schema exported from the Rust
-    // table, then hands it over through the Arrow C Data Interface. Rust
-    // consumes both release callbacks on a successful import; release whichever
-    // struct still holds its callback on any exit (partial imports, write
-    // failures) without double release.
-    std::shared_ptr<arrow::RecordBatch> record_batch;
-    RETURN_IF_ERROR(
-            _arrow_block_convertor.convert_to_arrow(table_order_block, &_arrow_pool, &record_batch));
+    std::shared_ptr<arrow::RecordBatch> record_batch =
+            arrow::RecordBatch::Make(_arrow_schema, sink_batch->num_rows(),
+                                     std::move(table_columns));
 
     ArrowArray c_array {};
     ArrowSchema c_schema {};
