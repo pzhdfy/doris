@@ -19,10 +19,14 @@
 
 #include "exec/sink/writer/paimon/paimon_dpcm_codec.h"
 
+#include <arrow/array/builder_base.h>
+#include <arrow/array/builder_primitive.h>
 #include <arrow/array/util.h>
+#include <arrow/buffer.h>
 #include <arrow/c/abi.h>
 #include <arrow/c/bridge.h>
 #include <arrow/record_batch.h>
+#include <arrow/util/decimal.h>
 #include <fmt/format.h>
 
 #include <algorithm>
@@ -48,6 +52,16 @@ namespace doris {
 
 namespace {
 
+// Runs an arrow::Status-returning statement; these helpers only produce that
+// one arrow error shape, so failures convert straight into a Doris Status.
+#define ARROW_TRY(stmt)                                                        \
+    do {                                                                       \
+        const ::arrow::Status& _arrow_status_ = (stmt);                        \
+        if (UNLIKELY(!_arrow_status_.ok())) {                                  \
+            return Status::InternalError("Arrow operation failed: {}",         \
+                                          _arrow_status_.ToString());          \
+        }                                                                      \
+    } while (0)
 // A copy of the schema with every field nullable: the input's nullability is
 // independent from the target table constraint, exactly as the JNI connector
 // declares its input fields (PaimonWriteSchema.java: "Input nullability is
@@ -62,6 +76,212 @@ std::shared_ptr<arrow::Schema> nullable_input_schema(const arrow::Schema& schema
         fields.push_back(field->WithNullable(true));
     }
     return arrow::schema(std::move(fields));
+}
+
+// Mirror DefaultValueUtils.convertDefaultValue: strip one pair of surrounding
+// single quotes, then the remaining text is cast to the field type.
+std::string strip_default_quotes(const std::string& raw) {
+    if (raw.size() >= 2 && raw.front() == '\'' && raw.back() == '\'') {
+        return raw.substr(1, raw.size() - 2);
+    }
+    return raw;
+}
+
+// Days since the civil epoch for a proleptic Gregorian date (Howard Hinnant's
+// algorithm), the value Date32 and date-portion parsing build on.
+int64_t days_from_civil(int64_t y, int m, int d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+// 'YYYY-MM-DD' -> days since epoch.
+bool parse_date32(const std::string& text, int32_t* days) {
+    int y = 0;
+    int m = 0;
+    int d = 0;
+    if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) != 3 || m < 1 || m > 12 || d < 1 || d > 31) {
+        return false;
+    }
+    *days = static_cast<int32_t>(days_from_civil(y, m, d));
+    return true;
+}
+
+// Scale an integer second/fraction pair to the Arrow timestamp unit, mirroring
+// paimon-rust's precision -> unit mapping (arrow/mod.rs timestamp_time_unit).
+bool scale_timestamp_unit(int64_t seconds, const std::string& fraction,
+                          arrow::TimeUnit::type unit, int64_t* value) {
+    int64_t subsecond = 0;
+    if (!fraction.empty()) {
+        double frac = 0;
+        if (sscanf(fraction.c_str(), "%lf", &frac) != 1 || frac < 0 || frac >= 1) {
+            return false;
+        }
+        switch (unit) {
+        case arrow::TimeUnit::SECOND:
+            subsecond = 0;
+            break;
+        case arrow::TimeUnit::MILLI:
+            subsecond = static_cast<int64_t>(frac * 1000);
+            break;
+        case arrow::TimeUnit::MICRO:
+            subsecond = static_cast<int64_t>(frac * 1000000);
+            break;
+        case arrow::TimeUnit::NANO:
+            subsecond = static_cast<int64_t>(frac * 1000000000);
+            break;
+        }
+    }
+    int64_t scaled = 0;
+    switch (unit) {
+    case arrow::TimeUnit::SECOND:
+        scaled = seconds;
+        break;
+    case arrow::TimeUnit::MILLI:
+        scaled = seconds * 1000;
+        break;
+    case arrow::TimeUnit::MICRO:
+        scaled = seconds * 1000000;
+        break;
+    case arrow::TimeUnit::NANO:
+        scaled = seconds * 1000000000;
+        break;
+    }
+    *value = scaled + subsecond;
+    return true;
+}
+
+// 'YYYY-MM-DD[ HH:MM:SS[.fff]]' (space or 'T' separator) -> unit-scaled value.
+bool parse_timestamp(const std::string& text, arrow::TimeUnit::type unit, int64_t* value) {
+    int y = 0;
+    int m = 0;
+    int d = 0;
+    if (sscanf(text.c_str(), "%d-%d-%d", &y, &m, &d) != 3) {
+        return false;
+    }
+    const int64_t days = days_from_civil(y, m, d);
+    int64_t seconds = days * 86400;
+    std::string fraction;
+    const auto sep = text.find_first_of(" T");
+    if (sep != std::string::npos) {
+        int hh = 0;
+        int mm = 0;
+        int ss = 0;
+        int consumed = 0;
+        if (sscanf(text.c_str() + sep + 1, "%d:%d:%d%n", &hh, &mm, &ss, &consumed) != 3 ||
+            hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 60) {
+            return false;
+        }
+        seconds += hh * 3600 + mm * 60 + ss;
+        fraction = text.substr(sep + 1 + consumed);
+        if (!fraction.empty() && fraction.front() != '.') {
+            return false;
+        }
+        fraction = fraction.empty() ? "" : fraction.substr(1);
+    }
+    return scale_timestamp_unit(seconds, fraction, unit, value);
+}
+
+// 'HH:MM:SS[.fff]' -> milliseconds (the unit of the writer's Time32 columns).
+bool parse_time32_ms(const std::string& text, int32_t* ms) {
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    int consumed = 0;
+    if (sscanf(text.c_str(), "%d:%d:%d%n", &hh, &mm, &ss, &consumed) != 3 || hh < 0 || hh > 23 ||
+        mm < 0 || mm > 59 || ss < 0 || ss > 59) {
+        return false;
+    }
+    std::string fraction = text.substr(consumed);
+    if (!fraction.empty() && fraction.front() != '.') {
+        return false;
+    }
+    double frac = fraction.empty() ? 0 : atof(fraction.c_str());
+    *ms = (hh * 3600 + mm * 60 + ss) * 1000 + static_cast<int32_t>(frac * 1000);
+    return true;
+}
+
+// Merge a column with its per-type default column: null slots take the default
+// bytes, everything else keeps the delivered value, and the result carries no
+// validity bitmap (all rows valid). Fixed-width layouts copy slot bytes
+// generically; the bit-packed and offset-based layouts build through their
+// builders.
+Status fill_null_with_default(const arrow::Array& column, const arrow::Array& default_column,
+                              arrow::MemoryPool* pool, std::shared_ptr<arrow::Array>* out) {
+    const auto& type = *column.type();
+    const int64_t length = column.length();
+    switch (type.id()) {
+    case arrow::Type::BOOL: {
+        const auto& in = static_cast<const arrow::BooleanArray&>(column);
+        const bool def = static_cast<const arrow::BooleanArray&>(default_column).Value(0);
+        arrow::BooleanBuilder builder(pool);
+        for (int64_t i = 0; i < length; ++i) {
+            ARROW_TRY(builder.Append(in.IsNull(i) ? def : in.Value(i)));
+        }
+        ARROW_TRY(builder.Finish(out));
+        return Status::OK();
+    }
+    case arrow::Type::STRING: {
+        const auto& in = static_cast<const arrow::StringArray&>(column);
+        const auto& def = static_cast<const arrow::StringArray&>(default_column);
+        arrow::StringBuilder builder(pool);
+        for (int64_t i = 0; i < length; ++i) {
+            ARROW_TRY(builder.Append(in.IsNull(i) ? def.GetView(0) : in.GetView(i)));
+        }
+        ARROW_TRY(builder.Finish(out));
+        return Status::OK();
+    }
+    case arrow::Type::BINARY: {
+        const auto& in = static_cast<const arrow::BinaryArray&>(column);
+        const auto& def = static_cast<const arrow::BinaryArray&>(default_column);
+        arrow::BinaryBuilder builder(pool);
+        for (int64_t i = 0; i < length; ++i) {
+            ARROW_TRY(builder.Append(in.IsNull(i) ? def.GetView(0) : in.GetView(i)));
+        }
+        ARROW_TRY(builder.Finish(out));
+        return Status::OK();
+    }
+    default: {
+        // Fixed-width primitive layouts (ints, floats, date/time/timestamp,
+        // decimal128): slot-byte copy with the default in the null slots.
+        const int32_t width = type.byte_width();
+        if (width <= 0) {
+            return Status::NotSupported(
+                    "paimon-rust FFI writer cannot apply a column default for type {}",
+                    type.ToString());
+        }
+        const uint8_t* src = column.data()->GetValues<uint8_t>(1);
+        const uint8_t* def = default_column.data()->GetValues<uint8_t>(1);
+        if (src == nullptr || def == nullptr) {
+            return Status::InternalError(
+                    "paimon-rust FFI writer column buffers missing for default fill of type {}",
+                    type.ToString());
+        }
+        auto buffer_res = arrow::AllocateResizableBuffer(static_cast<int64_t>(width) * length,
+                                                         pool);
+        if (!buffer_res.ok()) {
+            return Status::InternalError(
+                    "paimon-rust FFI writer allocate default-filled buffer failed: {}",
+                    buffer_res.status().ToString());
+        }
+        std::unique_ptr<arrow::Buffer> buffer = std::move(buffer_res).ValueOrDie();
+        uint8_t* dst = buffer->mutable_data();
+        for (int64_t i = 0; i < length; ++i) {
+            const uint8_t* from = column.IsNull(i) ? def : src;
+            memcpy(dst + i * width, from + i * width, width);
+        }
+        std::vector<std::shared_ptr<arrow::Buffer>> buffers;
+        buffers.emplace_back();
+        buffers.push_back(std::move(buffer));
+        // No validity buffer and null_count 0: every slot of the result is valid.
+        auto data = arrow::ArrayData::Make(column.type(), length, std::move(buffers), 0);
+        *out = arrow::MakeArray(std::move(data));
+        return Status::OK();
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +489,171 @@ Status FfiPaimonWriteBackend::validate_permutation(const arrow::Schema& schema,
     return Status::OK();
 }
 
+Status FfiPaimonWriteBackend::build_default_column(const arrow::Field& field,
+                                                  const std::string& raw_default,
+                                                  int64_t num_rows, arrow::MemoryPool* pool,
+                                                  std::shared_ptr<arrow::Array>* out) {
+    const std::string text = strip_default_quotes(raw_default);
+    const auto& type = field.type();
+    auto invalid = [&field, &text] {
+        return Status::InvalidArgument(
+                "Cannot cast column default '{}' to type {} of column '{}'", text,
+                field.type()->ToString(), field.name());
+    };
+    switch (type->id()) {
+    case arrow::Type::BOOL: {
+        arrow::BooleanBuilder builder(pool);
+        bool value = false;
+        if (boost::iequals(text, "true")) {
+            value = true;
+        } else if (boost::iequals(text, "false")) {
+            value = false;
+        } else if (text == "1") {
+            value = true;
+        } else if (text == "0") {
+            value = false;
+        } else {
+            return invalid();
+        }
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(value));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::INT8:
+    case arrow::Type::INT16:
+    case arrow::Type::INT32:
+    case arrow::Type::INT64: {
+        char* end = nullptr;
+        const long long parsed = std::strtoll(text.c_str(), &end, 10);
+        if (text.empty() || *end != '\0') {
+            return invalid();
+        }
+        arrow::Int64Builder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(static_cast<int64_t>(parsed)));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::UINT8:
+    case arrow::Type::UINT16:
+    case arrow::Type::UINT32:
+    case arrow::Type::UINT64: {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+        if (text.empty() || *end != '\0') {
+            return invalid();
+        }
+        arrow::UInt64Builder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(static_cast<uint64_t>(parsed)));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::FLOAT:
+    case arrow::Type::DOUBLE: {
+        char* end = nullptr;
+        const double parsed = std::strtod(text.c_str(), &end);
+        if (text.empty() || *end != '\0') {
+            return invalid();
+        }
+        arrow::DoubleBuilder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(parsed));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::STRING: {
+        arrow::StringBuilder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(text));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::BINARY: {
+        arrow::BinaryBuilder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(text));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::DATE32: {
+        int32_t days = 0;
+        if (!parse_date32(text, &days)) {
+            return invalid();
+        }
+        arrow::Date32Builder builder(pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(days));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::DATE64: {
+        int32_t days = 0;
+        if (!parse_date32(text, &days)) {
+            return invalid();
+        }
+        arrow::Date64Builder builder(pool);
+        const int64_t millis = static_cast<int64_t>(days) * 86400000;
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(millis));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::TIME32: {
+        int32_t ms = 0;
+        if (!parse_time32_ms(text, &ms)) {
+            return invalid();
+        }
+        arrow::Time32Builder builder(type, pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(ms));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::TIMESTAMP: {
+        const auto* ts_type = static_cast<const arrow::TimestampType*>(type.get());
+        int64_t value = 0;
+        if (!parse_timestamp(text, ts_type->unit(), &value)) {
+            return invalid();
+        }
+        arrow::TimestampBuilder builder(type, pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(value));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    case arrow::Type::DECIMAL128: {
+        auto parsed = arrow::Decimal128::FromString(text);
+        if (!parsed.ok()) {
+            return invalid();
+        }
+        arrow::Decimal128Builder builder(type, pool);
+        for (int64_t i = 0; i < num_rows; ++i) {
+            ARROW_TRY(builder.Append(*parsed));
+        }
+        ARROW_TRY(builder.Finish(out));
+        break;
+    }
+    default:
+        return Status::NotSupported(
+                "paimon-rust FFI writer cannot materialize column default '{}' for type {} of "
+                "column '{}'; route the table to the JNI writer",
+                text, type->ToString(), field.name());
+    }
+    return Status::OK();
+}
+
 Status FfiPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* state,
                                    RuntimeProfile* profile) {
     DORIS_CHECK(sink.__isset.backend_type && sink.backend_type == TPaimonWriteBackendType::FFI);
@@ -303,6 +688,19 @@ Status FfiPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* s
     std::map<std::string, std::string> options;
     if (sink.__isset.table_options) {
         options.insert(sink.table_options.begin(), sink.table_options.end());
+    }
+    // Column defaults ('doris.default.<column>' = raw schema default) are
+    // popped off here so the Rust table never sees them; write()
+    // materializes them exactly as the JNI connector does
+    // (PaimonWriteSchema + DefaultValueUtils).
+    static const std::string kDefaultPrefix = "doris.default.";
+    for (auto it = options.begin(); it != options.end();) {
+        if (boost::algorithm::starts_with(it->first, kDefaultPrefix)) {
+            _column_defaults[it->first.substr(kDefaultPrefix.size())] = it->second;
+            it = options.erase(it);
+        } else {
+            ++it;
+        }
     }
     normalize_rust_storage_options(&options, sink.table_location);
     std::vector<paimon_option> c_options;
@@ -432,7 +830,7 @@ Status FfiPaimonWriteBackend::create_writer(std::unique_ptr<IPaimonWriter>* writ
             validate_permutation(*_arrow_schema, permutation, _convertor_schema->num_fields()));
     auto ffi_writer = std::make_unique<FfiPaimonWriter>(
             FfiPaimonTableWrite::adopt(table_write.release()), _convertor_schema, _arrow_schema,
-            std::move(permutation), _timezone);
+            std::move(permutation), _column_defaults, _timezone);
     // Bind the Arrow column writers once, as the JNI path does; a binding
     // failure must surface here rather than on the first batch.
     RETURN_IF_ERROR(ffi_writer->init());
@@ -449,6 +847,7 @@ Status FfiPaimonWriteBackend::close() {
     _arrow_schema.reset();
     _column_permutation.clear();
     _convertor_schema.reset();
+    _column_defaults.clear();
     _opened = false;
     return Status::OK();
 }
@@ -460,13 +859,16 @@ Status FfiPaimonWriteBackend::close() {
 FfiPaimonWriter::FfiPaimonWriter(FfiPaimonTableWritePtr table_write,
                                  std::shared_ptr<arrow::Schema> convertor_schema,
                                  std::shared_ptr<arrow::Schema> arrow_schema,
-                                 std::vector<size_t> column_permutation, cctz::time_zone timezone)
+                                 std::vector<size_t> column_permutation,
+                                 std::map<std::string, std::string> column_defaults,
+                                 cctz::time_zone timezone)
         : _table_write(std::move(table_write)),
           _arrow_block_convertor(convertor_schema, timezone),
           _arrow_schema(std::move(arrow_schema)),
           _convertor_schema(std::move(convertor_schema)),
           _batch_schema(nullable_input_schema(*_arrow_schema)),
           _column_permutation(std::move(column_permutation)),
+          _column_defaults(std::move(column_defaults)),
           _timezone(timezone) {}
 
 // Out-of-line for the same reason as the backend's: only this TU sees
@@ -504,9 +906,23 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
     table_columns.reserve(_arrow_schema->num_fields());
     constexpr size_t kMissing = FfiPaimonWriteBackend::kMissingColumn;
     for (int i = 0; i < _arrow_schema->num_fields(); ++i) {
+        const auto& field = *_arrow_schema->field(i);
         if (_column_permutation[i] != kMissing) {
             table_columns.push_back(
                     sink_batch->column(static_cast<int>(_column_permutation[i])));
+            continue;
+        }
+        // INSERT-omitted fields take their schema default when the column has
+        // one -- the JNI connector's omitted-field expansion (PaimonWriteSchema
+        // fills every defaulted field it does not receive) -- and null
+        // otherwise.
+        auto def = _column_defaults.find(field.name());
+        if (def != _column_defaults.end()) {
+            std::shared_ptr<arrow::Array> default_column;
+            RETURN_IF_ERROR(FfiPaimonWriteBackend::build_default_column(
+                    field, def->second, sink_batch->num_rows(),
+                    static_cast<arrow::MemoryPool*>(&_arrow_pool), &default_column));
+            table_columns.push_back(std::move(default_column));
             continue;
         }
         auto null_array =
@@ -519,6 +935,39 @@ Status FfiPaimonWriter::write(RuntimeState* /*state*/, Block& block) {
         }
         table_columns.push_back(std::move(null_array).ValueOrDie());
     }
+
+    // Explicit NULLs on present nullable fields carrying a default are
+    // replaced with the default value, mirroring the Java writer's default
+    // wrapper (which runs after the NOT NULL check, so NOT NULL fields are
+    // deliberately left alone here for the pre-check below to reject,
+    // exactly as the Java check fires before its wrapper).
+    for (int i = 0; i < _arrow_schema->num_fields(); ++i) {
+        if (_column_permutation[i] == kMissing) {
+            continue;
+        }
+        const auto& field = *_arrow_schema->field(i);
+        if (!field.nullable()) {
+            continue;
+        }
+        auto def = _column_defaults.find(field.name());
+        if (def == _column_defaults.end()) {
+            continue;
+        }
+        auto& column = table_columns[i];
+        if (column->null_count() == 0) {
+            continue;
+        }
+        std::shared_ptr<arrow::Array> default_column;
+        RETURN_IF_ERROR(FfiPaimonWriteBackend::build_default_column(
+                field, def->second, column->length(),
+                static_cast<arrow::MemoryPool*>(&_arrow_pool), &default_column));
+        std::shared_ptr<arrow::Array> filled;
+        RETURN_IF_ERROR(fill_null_with_default(*column, *default_column,
+                                               static_cast<arrow::MemoryPool*>(&_arrow_pool),
+                                               &filled));
+        column = std::move(filled);
+    }
+
     std::shared_ptr<arrow::RecordBatch> record_batch =
             arrow::RecordBatch::Make(_batch_schema, sink_batch->num_rows(),
                                      std::move(table_columns));

@@ -100,11 +100,26 @@
     deletion_vector(dv_post_compact_write_jni，DV 表 compact 后 FFI 新写不可见)。
     对照实验：同 DDL deduplicate 表 FFI 写读回正常；Java 写 first-row 提交即 level-5 COMPACT。
     早先"同一会话 vs 不同会话"的表象是干扰项——真正变量是文件是否被 Java 压实过。
-  - **根因 B：Paimon 列 DEFAULT 语义缺失（2 案）**。Java 连接器（PaimonWriteSchema）对
-    **省略**的带 default 列在连接器层填 default；**显式 NULL** 由 paimon writer 的 default
-    wrapper 处理（nullable+default → 替换为 default；NOT NULL → 先拒 null）。FFI 路径两层都
-    没有：append_only(t_append_default 省略 name 被拒 "Cannot write null to non-null
-    column(name)")、schema_change(added_after 显式 NULL 未替换 'unknown'，line 4 mismatch)。
+  - **根因 B：Paimon 列 DEFAULT 语义缺失（2 案）——2026-10-30 已修复（纯 FE+BE，crate 仍为零改动）**。
+    FE 把有 default 的列以 `doris.default.<列名>` = 原始 schema default 字符串随 sink 的
+    tableOptions 下发；BE `open()` pop 掉这些键（不进 rust），`write()` 两点注入——**省略列**
+    用 `build_default_column()` 物化常量列（复刻连接器层：剥引号 + 字符串→类型 cast，
+    C++ 手写 strtoll/strtod/日期算法/`Decimal128::FromString`，覆盖 bool/整型/浮点/string/
+    binary/date/time/timestamp/decimal128），**显式 NULL 落在 nullable+default 列**逐槽位替换
+    default（复刻 writer 层 default wrapper；NOT NULL 列不替换，交给 null 预检先拒——Java
+    同样 NOT NULL 检查先于 wrapper）。与 JNI 实现差异：JNI 是行级 `GenericRow.setField`
+    （open 时求一次值、行行复用对象）；FFI 是 Arrow 列级常量/槽位操作，每 write() 批物化一次。
+    **5 场景修复前/后**（实测，2026-10-30 dvdbg 探针）：
+    | 场景 | JNI | FFI 修复前 | FFI 修复后 |
+    |---|---|---|---|
+    | 省略有 DEFAULT 的列（t_append_default (id) VALUES (1)，name NOT NULL DEFAULT 'unknown'） | 连接器填 'unknown'，成功，读回 1 unknown | BE 补 NULL → 预检拒绝 `Cannot write null to non-null column(name)` | ✅ 填 default，成功，读回 1 unknown |
+    | 显式 NULL → nullable+DEFAULT 列（added_after STRING NULL DEFAULT 'unknown'） | writer 替换 default，落 'unknown' | 原样落 NULL（读回 \N） | ✅ 替换 default，落 'unknown' |
+    | 显式 NULL → NOT NULL+DEFAULT 列（t_append_default (name,id) VALUES (NULL,2)） | 拒绝（检查先于 wrapper） | 预检拒绝（同消息） | ✅ 预检拒绝（同消息，不变） |
+    | 省略 NOT NULL 无 DEFAULT 列（t_append_required (id) VALUES (1)） | 拒绝 | 预检拒绝 | ✅ 预检拒绝（不变） |
+    | 省略 nullable 无 DEFAULT 列 | 落 NULL | 落 NULL | ✅ 落 NULL（不变） |
+    类型面另验：int '7'/double '1.5'/decimal '3.25'/bool 'true'/timestamp '2026-07-01 12:30:00'
+    全部物化正确；partition 列 default 同链路（BE 填值后 rust 按值路由分区）。append_only、
+    schema_change 两套件 solo 翻绿。
   - **根因 C：提交时 merge 压缩缺失（compaction 1 案）**。Java writer 两笔 INSERT 两个
     sorted run 触发 merge-tree compaction 合并为 1 文件；FFI 不做提交时压缩 → 2 个 level-0
     文件 → `expected:<1> but was:<2>`（读逻辑正确，仅文件形态分叉）。

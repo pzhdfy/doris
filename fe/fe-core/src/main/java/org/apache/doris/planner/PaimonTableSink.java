@@ -46,6 +46,7 @@ import com.google.common.base.Preconditions;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.types.DataField;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -226,6 +227,19 @@ public class PaimonTableSink extends BaseExternalTableDataSink {
             options.putAll(((PaimonJdbcMetaStoreProperties)
                     catalog.getCatalogProperty().getMetastoreProperties())
                     .getBackendPaimonOptions());
+        }
+        // Column defaults for the native writer, mirroring the JNI connector's
+        // omitted-field expansion (PaimonWriteSchema): the BE fills both
+        // INSERT-omitted fields and explicit NULLs on nullable fields from
+        // these values. The raw schema default strings travel here; the BE
+        // applies the same quote-strip plus string-to-type cast that
+        // DefaultValueUtils.convertDefaultValue performs on the Java side.
+        // The 'doris.default.' keys are popped off in the BE before the
+        // remaining options reach the Rust table.
+        for (DataField field : writeTarget.getTable().schema().fields()) {
+            if (field.defaultValue() != null) {
+                options.put("doris.default." + field.name(), field.defaultValue());
+            }
         }
         return options;
     }

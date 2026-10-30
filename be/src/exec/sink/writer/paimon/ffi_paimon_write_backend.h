@@ -20,6 +20,7 @@
 #include <cctz/time_zone.h>
 #include <gen_cpp/DataSinks_types.h>
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +32,8 @@
 #include "runtime/runtime_profile.h"
 
 namespace arrow {
+class Field;
+class MemoryPool;
 class Schema;
 }
 
@@ -99,6 +102,16 @@ public:
                                        const std::vector<size_t>& permutation,
                                        size_t sink_column_count);
 
+    /// Materialize a column of `num_rows` copies of the schema default for
+    /// `field`, replicating the JNI connector's default handling
+    /// (PaimonWriteSchema + DefaultValueUtils.convertDefaultValue): strip one
+    /// pair of surrounding single quotes, then cast the remaining text to the
+    /// field type. A pure function of the field and the default string, so
+    /// unit-testable without live FFI handles.
+    static Status build_default_column(const arrow::Field& field, const std::string& raw_default,
+                                       int64_t num_rows, arrow::MemoryPool* pool,
+                                       std::shared_ptr<arrow::Array>* out);
+
 private:
     /// The paimon-rust table and write-builder handles, RAII-wrapped (defined
     /// in the .cpp, like PaimonRustTableReader's handle struct, so that
@@ -118,6 +131,11 @@ private:
     /// The Arrow fields in delivered sink order (the subset the INSERT's
     /// column list produces), used as the Block->Arrow conversion schema.
     std::shared_ptr<arrow::Schema> _convertor_schema;
+    /// Raw schema defaults by table column name ('doris.default.<column>'
+    /// entries popped off the FE table options in open()). write() fills
+    /// INSERT-omitted fields and explicit NULLs on nullable fields from
+    /// them, mirroring the JNI connector's two default layers.
+    std::map<std::string, std::string> _column_defaults;
     /// Session timezone, captured in open() and reused by every writer adapter
     /// (the JNI backend does the same): the Arrow conversion of TIMESTAMP
     /// columns depends on it, and write() must not re-read it per batch.
@@ -140,11 +158,14 @@ public:
     /// (the conversion schema); `arrow_schema` is the full table-order schema
     /// the Rust writer validates against; `column_permutation` maps each
     /// table-order field to its sink position, or kMissingColumn for
-    /// INSERT-omitted fields.
+    /// INSERT-omitted fields; `column_defaults` maps table column names to
+    /// their raw schema defaults (empty when the table has none).
     explicit FfiPaimonWriter(FfiPaimonTableWritePtr table_write,
                              std::shared_ptr<arrow::Schema> convertor_schema,
                              std::shared_ptr<arrow::Schema> arrow_schema,
-                             std::vector<size_t> column_permutation, cctz::time_zone timezone);
+                             std::vector<size_t> column_permutation,
+                             std::map<std::string, std::string> column_defaults,
+                             cctz::time_zone timezone);
     ~FfiPaimonWriter() override;
 
     Status write(RuntimeState* state, Block& block) override;
@@ -171,6 +192,8 @@ private:
     /// columns under the table's own NOT NULL declarations.
     std::shared_ptr<arrow::Schema> _batch_schema;
     std::vector<size_t> _column_permutation;
+    /// Raw schema defaults by table column name (copied from the backend).
+    std::map<std::string, std::string> _column_defaults;
     cctz::time_zone _timezone;
 };
 
